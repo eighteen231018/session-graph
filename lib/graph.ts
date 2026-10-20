@@ -191,29 +191,39 @@ function resolveUnitParents(units: BranchUnit[], byId: Map<string, BranchUnit>):
  * A parent is always older. Without this, a newly forked transcript with fewer
  * messages can look like the parent of the original root, which flips the root
  * whenever another branch is added.
+ *
+ * Direction comes from an explicit creation time when both sides have one.
+ * Otherwise only a history wholly contained in the other proves direction: a
+ * fork copies its parent's history, so the contained side is the descendant.
+ * Message counts alone never decide, and a divergence with no creation time
+ * stays unknown rather than guessing a parent.
  */
 function inferParent(unit: BranchUnit, units: BranchUnit[]): string | null {
   if (unit.uuidSet.size === 0) return null
-
-  const isEarlier = (other: BranchUnit): boolean => {
-    if (other.uuidSet.size === 0) return false
-    if (other.createdAt > 0 && unit.createdAt > 0 && other.createdAt !== unit.createdAt) {
-      return other.createdAt < unit.createdAt
-    }
-    if (other.uuidSet.size !== unit.uuidSet.size) return other.uuidSet.size > unit.uuidSet.size
-    return other.id < unit.id
-  }
 
   let best: string | null = null
   let bestScore = -Infinity
   let bestCreated = -Infinity
   for (const other of units) {
-    if (other.id === unit.id || !isEarlier(other)) continue
-    const smaller = other.uuidSet.size <= unit.uuidSet.size ? other.uuidSet : unit.uuidSet
-    const larger = other.uuidSet.size <= unit.uuidSet.size ? unit.uuidSet : other.uuidSet
-    let shared = 0
-    for (const uuid of smaller) if (larger.has(uuid)) shared += 1
+    if (other.id === unit.id || other.uuidSet.size === 0) continue
+
+    const shared = sharedCount(unit.uuidSet, other.uuidSet)
     if (shared === 0) continue
+
+    if (unit.createdAt > 0 && other.createdAt > 0 && unit.createdAt !== other.createdAt) {
+      // Copied messages keep their timestamps, so only an explicit creation
+      // time may order the two; a parent is created no later than its fork.
+      if (other.createdAt > unit.createdAt) continue
+    } else if (shared !== other.uuidSet.size || other.uuidSet.size === unit.uuidSet.size) {
+      // No creation time: the candidate's whole history must be a proper part
+      // of this unit, as it is when a fork copied its parent and then grew.
+      // Identical copies and the reverse case (this unit still a prefix of the
+      // other) are ambiguous: either side may have grown, so they are left
+      // unknown rather than guessed, which also keeps growth from flipping an
+      // established direction.
+      continue
+    }
+
     // Prefer a full containment (one history was copied from the other), then
     // the most shared messages, then the most recent earlier branch.
     const containment = shared / Math.max(1, Math.min(unit.uuidSet.size, other.uuidSet.size))
@@ -225,6 +235,14 @@ function inferParent(unit: BranchUnit, units: BranchUnit[]): string | null {
     }
   }
   return best
+}
+
+function sharedCount(a: Set<string>, b: Set<string>): number {
+  const smaller = a.size <= b.size ? a : b
+  const larger = a.size <= b.size ? b : a
+  let shared = 0
+  for (const uuid of smaller) if (larger.has(uuid)) shared += 1
+  return shared
 }
 
 function breakCycles(parentOf: Map<string, string | null>): void {

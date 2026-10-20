@@ -1,16 +1,22 @@
 import { expect, test } from 'claude-code/testing'
-import type { EngineInterface, FsEntry } from 'claude-code'
+import type { FsEntry } from 'claude-code'
 import {
   forgetAppSession,
   scanAppSessions,
   type AppSessionRecord,
   type AppStoreDeps,
 } from '../lib/app-store'
-import { exportHtml } from '../lib/export'
+import { exportHtml, type ExportDeps } from '../lib/export'
 import { buildGraph, type SessionFile } from '../lib/graph'
 import { mcpResultText, parseJson } from '../lib/mcp-text'
 import type { ParsedMessage } from '../lib/parse'
-import { listAppSessions, type AppSessionDeps } from '../lib/session-link'
+import {
+  deleteAppSession,
+  invalidateSessionListCache,
+  listAppSessions,
+  openSession,
+  type AppSessionDeps,
+} from '../lib/session-link'
 
 function message(uuid: string, parentUuid: string | null, timestamp: number, role: 'user' | 'assistant', text: string): ParsedMessage {
   return {
@@ -203,15 +209,13 @@ test('the app session record maps every CLI transcript and the fork parent', asy
   const files = new Map<string, string>([[recordPath, recordJson]])
 
   const fake = {
-    env: { get: async (name: string) => (name === 'HOME' ? '/Users/me' : undefined) },
-    fs: {
-      exists: async (path: string) => path === store,
-      list: async (path: string) => listing.get(path) ?? [],
-      read: async (path: string) => {
-        const text = files.get(path)
-        if (text === undefined) throw new Error(`missing ${path}`)
-        return text
-      },
+    env: { home: '/Users/me' },
+    fsExists: async (path: string) => path === store,
+    fsList: async (path: string) => listing.get(path) ?? [],
+    fsRead: async (path: string) => {
+      const text = files.get(path)
+      if (text === undefined) throw new Error(`missing ${path}`)
+      return text
     },
   } as unknown as AppStoreDeps
 
@@ -257,16 +261,12 @@ test('exports are named by the full session id', async () => {
   const snapshot = buildGraph([transcript('root-cli', rootMessages)], 'root-cli', 'dark', 1)
   let writtenPath = ''
   const fake = {
-    session: {
-      id: async () => 'abcdef12-3456-7890-abcd-ef1234567890',
-      cwd: async () => '/tmp/project',
+    sessionId: async () => 'abcdef12-3456-7890-abcd-ef1234567890',
+    sessionCwd: async () => '/tmp/project',
+    fsWrite: async (path: string) => {
+      writtenPath = path
     },
-    fs: {
-      write: async (path: string) => {
-        writtenPath = path
-      },
-    },
-  } as unknown as EngineInterface
+  } as unknown as ExportDeps
 
   await exportHtml(fake, snapshot)
 
@@ -276,14 +276,10 @@ test('exports are named by the full session id', async () => {
 test('the tool door is tried when the MCP list_sessions answer is an error', async () => {
   let toolCalled = false
   const fake = {
-    mcp: {
-      call: async () => ({ isError: true, content: [] }),
-    },
-    tool: {
-      call: async () => {
-        toolCalled = true
-        return { text: JSON.stringify([{ sessionId: 'local_x', title: 'X', cwd: '/p' }]) }
-      },
+    mcpCall: async () => ({ isError: true, content: [] }),
+    toolCall: async () => {
+      toolCalled = true
+      return { text: JSON.stringify([{ sessionId: 'local_x', title: 'X', cwd: '/p' }]) }
     },
   } as unknown as AppSessionDeps
 
@@ -301,4 +297,175 @@ test('mcp text is read from content, text and nested result shapes', () => {
   expect(mcpResultText({ result: 'string-result' })).toBe('string-result')
   expect(mcpResultText(null)).toBe('')
   expect(parseJson('not json')).toBeNull()
+})
+
+// SG-02: a copied history plus new messages must not look like an older root.
+test('a fork that copied the history keeps the original as its parent', () => {
+  const root = transcript('root-cli', rootMessages)
+  const branch = transcript('branch-cli', branchMessages)
+  root.createdAt = 1000
+  branch.createdAt = 1000
+
+  const snapshot = buildGraph([root, branch], 'branch-cli', 'dark', 1)
+
+  expect(snapshot.cards.find(card => card.sessionId === 'branch-cli')?.parentSessionId).toBe('root-cli')
+  expect(snapshot.cards.find(card => card.sessionId === 'root-cli')?.parentSessionId).toBeNull()
+})
+
+test('growth on both sides leaves the direction unknown instead of reversed', () => {
+  const root = transcript('root-cli', [
+    ...rootMessages,
+    message('m6', 'm2', 6, 'user', 'root follow-up'),
+  ])
+  const branch = transcript('branch-cli', [
+    ...rootMessages,
+    message('m3', 'm2', 3, 'user', 'branch follow-up'),
+  ])
+  root.createdAt = 1000
+  branch.createdAt = 1000
+
+  const snapshot = buildGraph([root, branch], 'branch-cli', 'dark', 1)
+
+  const branchCard = snapshot.cards.find(card => card.sessionId === 'branch-cli')
+  expect(branchCard?.parentSessionId).toBeNull()
+  expect(snapshot.cards.some(card => card.parentSessionId === 'branch-cli')).toBe(false)
+})
+
+test('identical copied histories do not invent a parent', () => {
+  const root = transcript('root-cli', rootMessages)
+  const copy = transcript('copy-cli', rootMessages)
+  root.createdAt = 0
+  copy.createdAt = 0
+
+  const snapshot = buildGraph([root, copy], 'copy-cli', 'dark', 1)
+
+  expect(snapshot.cards.find(card => card.sessionId === 'copy-cli')?.parentSessionId).toBeNull()
+  expect(snapshot.cards.some(card => card.parentSessionId === 'copy-cli')).toBe(false)
+})
+
+// SG-03: an external deletion must hide every transcript the session owned.
+test('a tombstone expands to every transcript of the deleted session', async () => {
+  const base = '/Users/me'
+  const store = `${base}/Library/Application Support/Claude-3p/claude-code-sessions`
+  const org = `${store}/profile/org`
+  const recordPath = `${org}/local_tomb.json`
+  const recordJson = JSON.stringify({
+    sessionId: 'local_tomb',
+    cliSessionId: 'cli-tomb-new',
+    priorCliSessionIds: ['cli-tomb-old'],
+  })
+
+  const listing = new Map<string, FsEntry[]>([
+    [base, [entry('Library', 'dir')]],
+    [`${base}/Library`, [entry('Application Support', 'dir')]],
+    [`${base}/Library/Application Support`, [entry('Claude-3p', 'dir')]],
+    [store, [entry('profile', 'dir')]],
+    [`${store}/profile`, [entry('org', 'dir')]],
+    [org, [entry('local_tomb.json', 'file', 7)]],
+  ])
+  const files = new Map<string, string>([[recordPath, recordJson]])
+  const fake = {
+    env: { home: base },
+    fsExists: async (path: string) => path === store,
+    fsList: async (path: string) => listing.get(path) ?? [],
+    fsRead: async (path: string) => {
+      const text = files.get(path)
+      if (text === undefined) throw new Error(`missing ${path}`)
+      return text
+    },
+  } as unknown as AppStoreDeps
+
+  const before = await scanAppSessions(fake)
+  expect(before.records.some(record => record.id === 'local_tomb')).toBe(true)
+  expect(before.deletedTranscriptIds.has('cli-tomb-old')).toBe(false)
+
+  files.delete(recordPath)
+  listing.set(org, [entry('deleted_tomb', 'file', 9)])
+
+  const after = await scanAppSessions(fake)
+  for (const id of ['tomb', 'local_tomb', 'cli-tomb-new', 'cli-tomb-old']) {
+    expect(after.deletedTranscriptIds.has(id)).toBe(true)
+  }
+})
+
+// SG-04: an explicit app id that is absent must not open a title namesake.
+test('a missing explicit app id opens nothing', async () => {
+  invalidateSessionListCache()
+  const opened: string[][] = []
+  const fake = {
+    sessionCwd: async () => '/fake/project',
+    mcpCall: async () => ({
+      isError: false,
+      content: [{
+        type: 'text',
+        text: JSON.stringify([{
+          sessionId: 'local_other',
+          title: 'Same title',
+          cwd: '/fake/project',
+          link: 'claude://claude.ai/epitaxy/local_other',
+        }]),
+      }],
+    }),
+    toolCall: async () => {
+      throw new Error('the tool door must not be used when the MCP list answered')
+    },
+    processRun: async (argv: readonly string[]) => {
+      opened.push([...argv])
+      return { exitCode: 0, stdout: '', stderr: '' }
+    },
+  } as unknown as AppSessionDeps
+
+  const result = await openSession(fake, {
+    sessionId: 'local_missing',
+    title: 'Same title',
+    isCurrent: false,
+  })
+
+  expect(result.opened).toBe(false)
+  expect(result.reason).toBe('no-link')
+  expect(opened).toHaveLength(0)
+})
+
+// SG-05: the tool door accepts a content-wrapped text answer and rejects errors.
+test('the tool door reads content-wrapped text and refuses error answers', async () => {
+  invalidateSessionListCache()
+  const okFake = {
+    mcpCall: async () => ({ isError: true, content: [] }),
+    toolCall: async () => ({
+      content: [{ type: 'text', text: JSON.stringify([{ sessionId: 'local_app', title: 'T' }]) }],
+    }),
+  } as unknown as AppSessionDeps
+
+  const rows = await listAppSessions(okFake)
+  expect(rows?.[0]?.sessionId).toBe('local_app')
+
+  invalidateSessionListCache()
+  const errorFake = {
+    mcpCall: async () => ({ isError: true, content: [] }),
+    toolCall: async () => ({ isError: true, content: [{ type: 'text', text: 'boom' }] }),
+  } as unknown as AppSessionDeps
+
+  expect(await listAppSessions(errorFake)).toBeNull()
+})
+
+// SG-06: "skipped 0" is success; empty and unknown answers are not success.
+test('delete results tell skipped zero from a refusal', async () => {
+  const target = { sessionId: 'local_app', title: 'T', isCurrent: false }
+
+  const success = await deleteAppSession({
+    toolCall: async () => ({ text: 'Deleted 1 session; skipped 0 sessions.' }),
+  } as unknown as AppSessionDeps, target)
+  expect(success.ok).toBe(true)
+
+  const missing = await deleteAppSession({
+    toolCall: async () => ({ text: 'Deleted 0 sessions; skipped 1 session (not found).' }),
+  } as unknown as AppSessionDeps, target)
+  expect(missing.ok).toBe(false)
+  expect(missing.reason).toBe('not-found')
+
+  const empty = await deleteAppSession({
+    toolCall: async () => ({}),
+  } as unknown as AppSessionDeps, target)
+  expect(empty.ok).toBe(false)
+  expect(empty.reason).toBe('unknown')
 })

@@ -1,10 +1,12 @@
-import type { EngineInterface } from 'claude-code'
+import type { HostDeps } from './host'
 import type { GraphSnapshot } from '../types'
 import { layoutCardTree } from './tree'
 
-export async function exportHtml($: EngineInterface, snapshot: GraphSnapshot): Promise<string> {
-  const sessionId = await $.session.id()
-  const cwd = await $.session.cwd()
+export type ExportDeps = Pick<HostDeps, 'sessionId' | 'sessionCwd' | 'fsWrite'>
+
+export async function exportHtml(deps: ExportDeps, snapshot: GraphSnapshot): Promise<string> {
+  const sessionId = await deps.sessionId()
+  const cwd = await deps.sessionCwd()
   // The full id, not a short prefix: app session ids share the `local_`
   // prefix, and a short stem would make two exports overwrite each other.
   const path = `${cwd}/session-graph-${sessionId}.html`
@@ -82,7 +84,7 @@ ${cardsHtml}
 </body>
 </html>`
 
-  await $.fs.write(path, html)
+  await deps.fsWrite(path, html)
   return path
 }
 

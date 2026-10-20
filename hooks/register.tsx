@@ -3,11 +3,41 @@ import type { EngineInterface, Register, RenderElement, Timer } from 'claude-cod
 import type { BranchCard, GraphSnapshot } from '../types'
 import { forgetAppSession } from '../lib/app-store'
 import { collectGraph, listSessionIds } from '../lib/collect'
+import type { HostDeps } from '../lib/host'
 import { layoutCardTree } from '../lib/tree'
 import { exportHtml } from '../lib/export'
 import { deleteAppSession, openSession } from '../lib/session-link'
 
 const PANE = 'session-graph'
+
+/**
+ * The host, as closures bound here. `$` is followed by the plugin validator
+ * only inside a function declared in this module, so the library receives
+ * these plain functions and never `$` itself. Env names stay literals here so
+ * the host can list what the plugin reads.
+ */
+async function depsOf($: EngineInterface): Promise<HostDeps> {
+  return {
+    env: {
+      home: await $.env.get('HOME'),
+      userProfile: await $.env.get('USERPROFILE'),
+      appData: await $.env.get('APPDATA'),
+      localAppData: await $.env.get('LOCALAPPDATA'),
+      xdgConfigHome: await $.env.get('XDG_CONFIG_HOME'),
+    },
+    sessionId: () => $.session.id(),
+    sessionCwd: () => $.session.cwd(),
+    sessionMessages: () => $.session.messages(),
+    fsExists: path => $.fs.exists(path),
+    fsList: path => $.fs.list(path),
+    fsRead: path => $.fs.read(path),
+    fsWrite: (path, text) => $.fs.write(path, text),
+    configList: () => $.config.list(),
+    mcpCall: (server, tool, args) => $.mcp.call(server, tool, args),
+    toolCall: (args: Parameters<EngineInterface['tool']['call']>[0]) => $.tool.call(args),
+    processRun: (argv, init) => $.process.run(argv, init),
+  }
+}
 
 const EMPTY: GraphSnapshot = {
   nodes: [],
@@ -38,7 +68,7 @@ async function refresh($: EngineInterface, force = false): Promise<GraphSnapshot
 
   scanning = true
   try {
-    const snapshot = await collectGraph($)
+    const snapshot = await collectGraph(await depsOf($))
     const signature = signatureOf(snapshot)
     if (force || signature !== lastSignature) {
       await update($, snapshotAtom, () => snapshot)
@@ -70,7 +100,7 @@ async function watchSessionSet($: EngineInterface): Promise<void> {
   if (watching) return
   watching = true
   try {
-    const ids = await listSessionIds($)
+    const ids = await listSessionIds(await depsOf($))
     if (ids === null) return
     const key = [...ids].sort().join('|')
     if (knownIds === null) {
@@ -383,7 +413,7 @@ async function runExport(
   notify: boolean,
 ): Promise<{ ok: boolean; text: string }> {
   try {
-    const path = await exportHtml($, snapshot)
+    const path = await exportHtml(await depsOf($), snapshot)
     $.ui.log(`session-graph: exported ${path}`)
     if (notify) $.ui.toast('已导出静态视图')
     return { ok: true, text: `已导出静态视图：${path}` }
@@ -435,11 +465,10 @@ async function openCard($: EngineInterface, card: BranchCard): Promise<void> {
     return
   }
 
-  const result = await openSession($, {
+  const result = await openSession(await depsOf($), {
     sessionId: card.sessionId,
     title: card.matchTitle !== '' ? card.matchTitle : card.title,
     isCurrent: card.isCurrent,
-    lastTimestamp: card.lastTimestamp,
   })
   if (result.opened) {
     $.ui.toast(result.reason === 'constructed' ? `已尝试打开「${card.title}」` : `正在打开「${card.title}」`)
@@ -478,11 +507,10 @@ async function deleteCard($: EngineInterface, card: BranchCard): Promise<void> {
     }
     if (answer !== '删除') return
 
-    const result = await deleteAppSession($, {
+    const result = await deleteAppSession(await depsOf($), {
       sessionId: card.sessionId,
       title: card.matchTitle !== '' ? card.matchTitle : card.title,
       isCurrent: false,
-      lastTimestamp: card.lastTimestamp,
     })
     if (!result.ok) {
       // The card may outlive the app session (a transcript whose record is

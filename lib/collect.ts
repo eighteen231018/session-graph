@@ -1,12 +1,13 @@
-import type { EngineInterface, FsEntry, SessionMessage } from 'claude-code'
+import type { FsEntry, SessionMessage } from 'claude-code'
 import type { BranchCard, GraphNode, GraphSnapshot, SessionInfo } from '../types'
 import { listDeletedTranscriptIds, scanAppSessions, type AppSessionRecord } from './app-store'
 import { buildGraph, type SessionFile } from './graph'
+import type { HostDeps } from './host'
 import { mcpResultText, parseJson } from './mcp-text'
 import { parseTranscript, previewOf, type ParsedTranscript } from './parse'
 import { listAppSessions, type AppSessionRow } from './session-link'
 
-export type CollectDeps = Pick<EngineInterface, 'fs' | 'env' | 'session' | 'process' | 'config' | 'mcp' | 'tool'>
+export type CollectDeps = HostDeps
 
 type Cached = {
   mtimeMs: number
@@ -16,47 +17,47 @@ type Cached = {
 const cache = new Map<string, Cached>()
 let projectDirCache: { sessionId: string; dir: string } | undefined
 
-export async function collectGraph($: CollectDeps): Promise<GraphSnapshot> {
+export async function collectGraph(deps: CollectDeps): Promise<GraphSnapshot> {
   const scannedAt = Date.now()
-  const theme = await readTheme($)
+  const theme = await readTheme(deps)
 
   let sessionId = ''
   try {
-    sessionId = await $.session.id()
+    sessionId = await deps.sessionId()
   } catch {
     return emptySnapshot(theme, scannedAt, '无法读取当前会话 ID。')
   }
   if (sessionId === '') return emptySnapshot(theme, scannedAt, '无法读取当前会话 ID。')
 
-  const projectsRoot = await findProjectsRoot($)
+  const projectsRoot = await findProjectsRoot(deps)
   if (projectsRoot === null) {
-    return linearFallback($, sessionId, theme, scannedAt, '找不到 ~/.claude/projects；已降级为官方会话消息的线性视图。')
+    return linearFallback(deps, sessionId, theme, scannedAt, '找不到 ~/.claude/projects；已降级为官方会话消息的线性视图。')
   }
 
-  const projectDir = await findProjectDir($, projectsRoot, sessionId)
+  const projectDir = await findProjectDir(deps, projectsRoot, sessionId)
   if (projectDir === null) {
-    return linearFallback($, sessionId, theme, scannedAt, '找不到当前会话的转录文件；已降级为官方会话消息的线性视图。')
+    return linearFallback(deps, sessionId, theme, scannedAt, '找不到当前会话的转录文件；已降级为官方会话消息的线性视图。')
   }
 
-  const files = await readSessionFiles($, projectDir, sessionId)
+  const files = await readSessionFiles(deps, projectDir, sessionId)
   if (files.length === 0) {
-    return linearFallback($, sessionId, theme, scannedAt, '转录文件不可读；已降级为官方会话消息的线性视图。')
+    return linearFallback(deps, sessionId, theme, scannedAt, '转录文件不可读；已降级为官方会话消息的线性视图。')
   }
 
-  const appScan = await scanAppSessions($)
+  const appScan = await scanAppSessions(deps)
   // A deleted session's transcript file can outlive its app record; the
   // tombstone says the branch is gone, so it must not come back as a card.
   const visible = files.filter(file =>
     file.id === sessionId || !appScan.deletedTranscriptIds.has(file.id),
   )
   if (visible.length === 0) {
-    return linearFallback($, sessionId, theme, scannedAt, '转录已删除；已降级为官方会话消息的线性视图。')
+    return linearFallback(deps, sessionId, theme, scannedAt, '转录已删除；已降级为官方会话消息的线性视图。')
   }
-  await applyCreationTimes($, visible, appScan.records)
+  await applyCreationTimes(deps, visible, appScan.records)
   const snapshot = buildGraph(visible, sessionId, theme, scannedAt, undefined, appScan.records)
   if (!snapshot.cards.some(card => card.isCurrent)) {
     return linearFallback(
-      $,
+      deps,
       sessionId,
       theme,
       scannedAt,
@@ -64,27 +65,27 @@ export async function collectGraph($: CollectDeps): Promise<GraphSnapshot> {
     )
   }
   if (snapshot.nodes.length === 0) {
-    return linearFallback($, sessionId, theme, scannedAt, '转录中没有可显示的消息；已降级为官方会话消息的线性视图。')
+    return linearFallback(deps, sessionId, theme, scannedAt, '转录中没有可显示的消息；已降级为官方会话消息的线性视图。')
   }
   return snapshot
 }
 
-export async function listSessionIds($: CollectDeps): Promise<string[] | null> {
+export async function listSessionIds(deps: CollectDeps): Promise<string[] | null> {
   let sessionId = ''
   try {
-    sessionId = await $.session.id()
+    sessionId = await deps.sessionId()
   } catch {
     return null
   }
   if (sessionId === '') return null
 
-  const root = await findProjectsRoot($)
+  const root = await findProjectsRoot(deps)
   if (root === null) return null
-  const dir = await findProjectDir($, root, sessionId)
+  const dir = await findProjectDir(deps, root, sessionId)
   if (dir === null) return null
 
   try {
-    const entries = await $.fs.list(dir)
+    const entries = await deps.fsList(dir)
     const releasedSuffix = '.desktop-released.json'
     const ids = entries
       .filter(entry => entry.kind === 'file' && entry.name.endsWith('.jsonl'))
@@ -97,7 +98,7 @@ export async function listSessionIds($: CollectDeps): Promise<string[] | null> {
     // A deleted session's transcript can stay on disk; its tombstone is the
     // only change the watch can notice. Prefix it so it never collides with a
     // live transcript id and can only appear or disappear.
-    const deleted = await listDeletedTranscriptIds($)
+    const deleted = await listDeletedTranscriptIds(deps)
     for (const id of deleted) ids.push(`deleted:${id}`)
     return ids
   } catch {
@@ -105,21 +106,21 @@ export async function listSessionIds($: CollectDeps): Promise<string[] | null> {
   }
 }
 
-async function findProjectsRoot($: CollectDeps): Promise<string | null> {
-  const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE'))
+async function findProjectsRoot(deps: CollectDeps): Promise<string | null> {
+  const home = deps.env.home ?? deps.env.userProfile
   if (home === undefined || home === '') return null
   const root = `${home.replace(/[\\/]+$/, '')}/.claude/projects`
   try {
-    return (await $.fs.exists(root)) ? root : null
+    return (await deps.fsExists(root)) ? root : null
   } catch {
     return null
   }
 }
 
-async function findProjectDir($: CollectDeps, root: string, sessionId: string): Promise<string | null> {
+async function findProjectDir(deps: CollectDeps, root: string, sessionId: string): Promise<string | null> {
   if (projectDirCache !== undefined && projectDirCache.sessionId === sessionId) {
     try {
-      if (await $.fs.exists(`${projectDirCache.dir}/${sessionId}.jsonl`)) return projectDirCache.dir
+      if (await deps.fsExists(`${projectDirCache.dir}/${sessionId}.jsonl`)) return projectDirCache.dir
     } catch {
       // fall through to a fresh scan
     }
@@ -127,7 +128,7 @@ async function findProjectDir($: CollectDeps, root: string, sessionId: string): 
 
   let dirs: FsEntry[] = []
   try {
-    dirs = await $.fs.list(root)
+    dirs = await deps.fsList(root)
   } catch {
     return null
   }
@@ -136,7 +137,7 @@ async function findProjectDir($: CollectDeps, root: string, sessionId: string): 
     if (entry.kind !== 'dir') continue
     const dir = `${root}/${entry.name}`
     try {
-      const inner = await $.fs.list(dir)
+      const inner = await deps.fsList(dir)
       if (inner.some(candidate => candidate.name === `${sessionId}.jsonl`)) {
         projectDirCache = { sessionId, dir }
         return dir
@@ -148,10 +149,10 @@ async function findProjectDir($: CollectDeps, root: string, sessionId: string): 
 
   // Project folders are named by replacing non-alphanumerics in the cwd with "-".
   try {
-    const cwd = await $.session.cwd()
+    const cwd = await deps.sessionCwd()
     const encoded = cwd.replace(/[^A-Za-z0-9]/g, '-')
     const dir = `${root}/${encoded}`
-    if (await $.fs.exists(`${dir}/${sessionId}.jsonl`)) {
+    if (await deps.fsExists(`${dir}/${sessionId}.jsonl`)) {
       projectDirCache = { sessionId, dir }
       return dir
     }
@@ -161,10 +162,10 @@ async function findProjectDir($: CollectDeps, root: string, sessionId: string): 
   return null
 }
 
-async function readSessionFiles($: CollectDeps, dir: string, currentSessionId: string): Promise<SessionFile[]> {
+async function readSessionFiles(deps: CollectDeps, dir: string, currentSessionId: string): Promise<SessionFile[]> {
   let entries: FsEntry[] = []
   try {
-    entries = await $.fs.list(dir)
+    entries = await deps.fsList(dir)
   } catch {
     return []
   }
@@ -204,14 +205,18 @@ async function readSessionFiles($: CollectDeps, dir: string, currentSessionId: s
         id,
         path,
         mtimeMs: entry.mtimeMs,
-        createdAt: cached.parsed.firstTimestamp,
+        // A fork copies the parent's messages and their timestamps, so the
+        // first message's time is not when this session was created. Only an
+        // app record's createdAt may fill this in; inheritance must not rest
+        // on a copied timestamp.
+        createdAt: 0,
         title: cached.parsed.title,
         messages: cached.parsed.messages,
       })
       continue
     }
 
-    const text = await readTranscript($, path)
+    const text = await readTranscript(deps, path)
     if (text === null) continue
     const parsed = parseTranscript(text, id)
     cache.set(path, { mtimeMs: entry.mtimeMs, parsed })
@@ -219,7 +224,7 @@ async function readSessionFiles($: CollectDeps, dir: string, currentSessionId: s
       id,
       path,
       mtimeMs: entry.mtimeMs,
-      createdAt: parsed.firstTimestamp,
+      createdAt: 0,
       title: parsed.title,
       messages: parsed.messages,
     })
@@ -243,7 +248,7 @@ const createdAtCache = new Map<string, { at: number; value: number | null }>()
  * transcripts without one (CLI/VS Code sessions) ask the app session manager.
  */
 async function applyCreationTimes(
-  $: CollectDeps,
+  deps: CollectDeps,
   files: SessionFile[],
   appSessions: AppSessionRecord[],
 ): Promise<void> {
@@ -267,7 +272,7 @@ async function applyCreationTimes(
 
   let rows: AppSessionRow[] | null = null
   try {
-    rows = await listAppSessions($, false)
+    rows = await listAppSessions(deps, false)
   } catch {
     rows = null
   }
@@ -275,7 +280,7 @@ async function applyCreationTimes(
 
   let cwd: string | null = null
   try {
-    cwd = await $.session.cwd()
+    cwd = await deps.sessionCwd()
   } catch {
     cwd = null
   }
@@ -284,7 +289,7 @@ async function applyCreationTimes(
   for (const file of unmatched) {
     const row = matchAppRow(rows, file, cwd, exactIds)
     if (row === undefined || typeof row.sessionId !== 'string' || row.sessionId === '') continue
-    const createdAt = await fetchCreatedAt($, row.sessionId)
+    const createdAt = await fetchCreatedAt(deps, row.sessionId)
     if (createdAt !== null) file.createdAt = createdAt
   }
 }
@@ -305,18 +310,14 @@ function matchAppRow(
     && (cwd === null || row.cwd === cwd)
     && !(typeof row.sessionId === 'string' && exactIds.has(row.sessionId)),
   )
-  if (sameTitle.length === 0) return undefined
-
-  const last = file.messages.length > 0 ? file.messages[file.messages.length - 1]!.timestamp : 0
-  const distance = (row: AppSessionRow): number => {
-    if (last <= 0 || typeof row.lastActivityAt !== 'string') return Number.POSITIVE_INFINITY
-    const activity = Date.parse(row.lastActivityAt)
-    return Number.isFinite(activity) ? Math.abs(activity - last) : Number.POSITIVE_INFINITY
-  }
-  return sameTitle.sort((a, b) => distance(a) - distance(b))[0]
+  // A title is not an identity. With two same-titled sessions in the same
+  // directory the nearest-by-activity pick may belong to another branch, and
+  // a wrong createdAt would order the fork tree backwards; leave it unknown.
+  if (sameTitle.length !== 1) return undefined
+  return sameTitle[0]
 }
 
-async function fetchCreatedAt($: CollectDeps, appSessionId: string): Promise<number | null> {
+async function fetchCreatedAt(deps: CollectDeps, appSessionId: string): Promise<number | null> {
   const now = Date.now()
   const cached = createdAtCache.get(appSessionId)
   if (cached !== undefined && (cached.value !== null || now - cached.at < 60_000)) return cached.value
@@ -338,7 +339,7 @@ async function fetchCreatedAt($: CollectDeps, appSessionId: string): Promise<num
 
   let value: number | null = null
   try {
-    value = read(await $.mcp.call('ccd_session_mgmt', 'get_session', { session_id: appSessionId }))
+    value = read(await deps.mcpCall('ccd_session_mgmt', 'get_session', { session_id: appSessionId }))
   } catch {
     value = null
   }
@@ -346,14 +347,14 @@ async function fetchCreatedAt($: CollectDeps, appSessionId: string): Promise<num
   return value
 }
 
-async function readTranscript($: CollectDeps, path: string): Promise<string | null> {
+async function readTranscript(deps: CollectDeps, path: string): Promise<string | null> {
   try {
-    return await $.fs.read(path)
+    return await deps.fsRead(path)
   } catch {
     // A long transcript is over $.fs.read's 4 MiB cap; read its tail and drop
     // the first partial line. Without a host process, degrade to linear.
     try {
-      const tail = await $.process.run(['tail', '-c', '3900000', path], { timeoutMs: 10000 })
+      const tail = await deps.processRun(['tail', '-c', '3900000', path], { timeoutMs: 10000 })
       if (tail.exitCode !== 0) return null
       const newline = tail.stdout.indexOf('\n')
       return newline >= 0 ? tail.stdout.slice(newline + 1) : tail.stdout
@@ -363,9 +364,9 @@ async function readTranscript($: CollectDeps, path: string): Promise<string | nu
   }
 }
 
-async function readTheme($: CollectDeps): Promise<'light' | 'dark'> {
+async function readTheme(deps: CollectDeps): Promise<'light' | 'dark'> {
   try {
-    const rows = await $.config.list()
+    const rows = await deps.configList()
     const row = rows.find(candidate => candidate.key === 'theme')
     const value = String(row?.value ?? '').toLowerCase()
     return value.includes('light') ? 'light' : 'dark'
@@ -375,7 +376,7 @@ async function readTheme($: CollectDeps): Promise<'light' | 'dark'> {
 }
 
 async function linearFallback(
-  $: CollectDeps,
+  deps: CollectDeps,
   sessionId: string,
   theme: 'light' | 'dark',
   scannedAt: number,
@@ -383,7 +384,7 @@ async function linearFallback(
 ): Promise<GraphSnapshot> {
   let rows: readonly SessionMessage[] = []
   try {
-    const result = await $.session.messages()
+    const result = await deps.sessionMessages()
     if (Array.isArray(result)) rows = result
   } catch {
     rows = []

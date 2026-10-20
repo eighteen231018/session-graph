@@ -1,11 +1,10 @@
-import type { EngineInterface } from 'claude-code'
-import { mcpResultText } from './mcp-text'
+import type { HostDeps } from './host'
+import { mcpResultText, parseJson, textBlocks } from './mcp-text'
 
 export type SessionTarget = {
   sessionId: string
   title: string
   isCurrent: boolean
-  lastTimestamp?: number
 }
 
 export type OpenSessionResult = {
@@ -16,8 +15,8 @@ export type OpenSessionResult = {
 export type DeleteSessionResult = {
   ok: boolean
   message: string
-  /** `not-found`: the app has no session behind this card. */
-  reason?: 'not-found' | 'refused' | 'unavailable'
+  /** `unknown`: the manager answered in a shape this plugin cannot judge. */
+  reason?: 'not-found' | 'refused' | 'unavailable' | 'unknown'
 }
 
 export type AppSessionRow = {
@@ -33,30 +32,33 @@ type ResolvedLink = {
   kind: 'link' | 'constructed'
 }
 
+export type AppSessionDeps = Pick<HostDeps, 'sessionCwd' | 'mcpCall' | 'toolCall' | 'processRun'>
+
 let cached: { at: number; rows: AppSessionRow[] } | undefined
 
 /**
  * Best-effort jump: the app's session manager returns a `claude://` link for
  * every local session. Cards carry the app's own session id (`local_...`), so
- * the row is matched exactly; older cards that carry a transcript id still try
- * the local id, then a title + cwd match. When that server is unavailable the
- * only fallback is the CLI-style link, which is not valid for app-created ids.
+ * that id is matched exactly and nothing else is opened in its place. Older
+ * cards that carry a transcript id may fall back to a unique title match.
+ * When the manager is unavailable the only fallback is the CLI-style link,
+ * which is not valid for app-created ids.
  */
 export async function openSession(
-  $: EngineInterface,
+  deps: AppSessionDeps,
   target: SessionTarget,
 ): Promise<OpenSessionResult> {
   if (target.isCurrent) return { opened: false, reason: 'current' }
 
-  const resolved = await resolveLink($, target)
+  const resolved = await resolveLink(deps, target)
   if (resolved === null) return { opened: false, reason: 'no-link' }
-  if (await openUrl($, resolved.link)) return { opened: true, reason: resolved.kind }
+  if (await openUrl(deps, resolved.link)) return { opened: true, reason: resolved.kind }
   return { opened: false, reason: 'open-failed' }
 }
 
-async function resolveLink($: EngineInterface, target: SessionTarget): Promise<ResolvedLink | null> {
-  const cwd = await safeCwd($)
-  const rows = await listSessions($)
+async function resolveLink(deps: AppSessionDeps, target: SessionTarget): Promise<ResolvedLink | null> {
+  const cwd = await safeCwd(deps)
+  const rows = await listSessions(deps)
 
   if (rows !== null) {
     const match = matchRow(rows, target, cwd)
@@ -78,29 +80,44 @@ function matchRow(
   target: SessionTarget,
   cwd: string | null,
 ): AppSessionRow | undefined {
-  const appId = target.sessionId.startsWith('local_') ? target.sessionId : `local_${target.sessionId}`
-  const exact = rows.find(row => row.sessionId === appId || row.sessionId === target.sessionId)
+  if (target.sessionId === '') return undefined
+  const isAppId = target.sessionId.startsWith('local_')
+  const ids = isAppId
+    ? [target.sessionId]
+    : [target.sessionId, `local_${target.sessionId}`]
+  const exact = rows.find(row =>
+    typeof row.sessionId === 'string' && ids.includes(row.sessionId),
+  )
+  if (exact !== undefined) return exact
+
+  // An explicit app id is an identity claim: if it is absent from the list,
+  // the session is gone or the list is stale. Opening a same-titled session
+  // would silently jump to the wrong conversation, so do not try.
+  if (isAppId) return undefined
+
+  // A legacy transcript id may still be part of the app's id. Keep this
+  // directional (the row's id contains the transcript id), never a title.
   const byId = rows.find(row =>
     typeof row.sessionId === 'string' && row.sessionId.includes(target.sessionId),
   )
-  const sameTitle = target.title === ''
-    ? []
-    : rows.filter(row => row.title === target.title && (cwd === null || row.cwd === cwd))
-  const activityDistance = (row: AppSessionRow): number => {
-    if (target.lastTimestamp === undefined) return 0
-    const activity = typeof row.lastActivityAt === 'string' ? Date.parse(row.lastActivityAt) : Number.NaN
-    return Number.isFinite(activity) ? Math.abs(activity - target.lastTimestamp) : Number.POSITIVE_INFINITY
-  }
-  const byTitle = sameTitle.sort((a, b) => activityDistance(a) - activityDistance(b))[0]
-  return exact ?? byId ?? byTitle
+  if (byId !== undefined) return byId
+
+  if (target.title === '') return undefined
+  const sameTitle = rows.filter(row =>
+    row.title === target.title && (cwd === null || row.cwd === cwd),
+  )
+  // A title is not an identity. Only a single candidate in this directory is
+  // unambiguous enough to open; two or more could be a different branch.
+  return sameTitle.length === 1 ? sameTitle[0] : undefined
 }
 
 export async function resolveAppSessionId(
-  $: EngineInterface,
+  deps: AppSessionDeps,
   target: SessionTarget,
 ): Promise<string | null> {
+  if (target.sessionId === '') return null
   if (target.sessionId.startsWith('local_')) return target.sessionId
-  const rows = await listSessions($)
+  const rows = await listSessions(deps)
   if (rows !== null) {
     const appId = `local_${target.sessionId}`
     const exact = rows.find(row => row.sessionId === appId)
@@ -124,12 +141,12 @@ export async function resolveAppSessionId(
  * not reachable, nothing is deleted.
  */
 export async function deleteAppSession(
-  $: EngineInterface,
+  deps: AppSessionDeps,
   target: SessionTarget,
 ): Promise<DeleteSessionResult> {
   if (target.isCurrent) return { ok: false, reason: 'refused', message: '不能删除当前正在运行的会话' }
 
-  const appSessionId = await resolveAppSessionId($, target)
+  const appSessionId = await resolveAppSessionId(deps, target)
   if (appSessionId === null) {
     return {
       ok: false,
@@ -139,27 +156,14 @@ export async function deleteAppSession(
   }
 
   try {
-    const result = await $.tool.call({
+    const result = await deps.toolCall({
       tool: 'mcp__ccd_session_mgmt__delete_session',
       session_ids: [appSessionId],
       reason: 'Deleted from the session-graph pane',
-    }) as { text?: unknown; result?: unknown; content?: unknown; isError?: unknown }
+    })
 
     cached = undefined
-    const text = mcpResultText(result)
-    const nestedError = result.result !== null && typeof result.result === 'object'
-      && (result.result as { isError?: unknown }).isError === true
-    if (result.isError === true || nestedError) {
-      if (/not found|no longer available|does not exist|不存在/i.test(text)) {
-        return { ok: false, reason: 'not-found', message: text }
-      }
-      return { ok: false, reason: 'refused', message: text === '' ? '应用拒绝删除该会话' : text }
-    }
-    if (/(skipped|refused|not deleted|not found|未删除|跳过|不存在|0 (sessions? )?deleted|no sessions? (were )?deleted)/i.test(text)) {
-      const missing = /not found|不存在/i.test(text)
-      return { ok: false, ...(missing ? { reason: 'not-found' as const } : { reason: 'refused' as const }), message: text }
-    }
-    return { ok: true, message: text === '' ? '已删除' : text }
+    return judgeDeleteResult(result, appSessionId)
   } catch (error) {
     cached = undefined
     const message = error instanceof Error ? error.message : String(error)
@@ -171,42 +175,155 @@ export async function deleteAppSession(
   }
 }
 
+function judgeDeleteResult(result: unknown, appSessionId: string): DeleteSessionResult {
+  const record = isRecord(result) ? result : {}
+  const text = (typeof result === 'string' ? result : mcpResultText(result)).trim()
+
+  if (hasErrorFlag(result)) {
+    return {
+      ok: false,
+      reason: isNotFoundText(text) ? 'not-found' : 'refused',
+      message: text === '' ? '应用拒绝删除该会话' : text,
+    }
+  }
+
+  const structured = judgeStructuredDelete(record, appSessionId, text)
+  if (structured !== null) return structured
+
+  const deleted = countFor(text, /deleted\s+(\d+)/i)
+    ?? countFor(text, /(\d+)\s+(?:sessions?\s+)?deleted\b/i)
+  const skipped = countFor(text, /skipped\s+(\d+)/i)
+    ?? countFor(text, /(\d+)\s+(?:sessions?\s+)?skipped\b/i)
+
+  if (deleted !== null) {
+    // We ask for one session, so one deletion is this one even if another
+    // entry in the same answer was skipped.
+    if (deleted > 0) return { ok: true, message: text }
+    return {
+      ok: false,
+      reason: isNotFoundText(text) ? 'not-found' : 'refused',
+      message: text === '' ? '没有会话被删除' : text,
+    }
+  }
+  if (skipped !== null && skipped > 0) {
+    return {
+      ok: false,
+      reason: isNotFoundText(text) ? 'not-found' : 'refused',
+      message: text === '' ? '应用跳过了该会话' : text,
+    }
+  }
+  if (/success(?:fully)?\s+deleted|已删除/i.test(text)) {
+    return { ok: true, message: text }
+  }
+  if (isNotFoundText(text)) {
+    return { ok: false, reason: 'not-found', message: text }
+  }
+  if (/refused|not deleted|denied|failed|未删除|失败|拒绝/i.test(text)) {
+    return { ok: false, reason: 'refused', message: text }
+  }
+  return {
+    ok: false,
+    reason: 'unknown',
+    message: text === '' ? '会话管理器返回了空结果，未确认是否删除' : `无法判断删除结果：${text}`,
+  }
+}
+
+function judgeStructuredDelete(
+  record: Record<string, unknown>,
+  appSessionId: string,
+  text: string,
+): DeleteSessionResult | null {
+  const payloads: Record<string, unknown>[] = [record]
+  if (isRecord(record.result)) payloads.push(record.result)
+
+  for (const payload of payloads) {
+    const ids = payload.deletedSessionIds ?? payload.deleted_session_ids
+    if (Array.isArray(ids)) {
+      const values = ids.filter((id): id is string => typeof id === 'string')
+      if (values.includes(appSessionId)) {
+        return { ok: true, message: text === '' ? '已删除' : text }
+      }
+      return {
+        ok: false,
+        reason: 'refused',
+        message: text === '' ? '目标会话未被删除' : text,
+      }
+    }
+
+    const deleted = numberField(payload, ['deleted', 'deletedCount', 'deleted_count'])
+    const skipped = numberField(payload, ['skipped', 'skippedCount', 'skipped_count'])
+    if (deleted !== null) {
+      if (deleted > 0) return { ok: true, message: text === '' ? '已删除' : text }
+      return {
+        ok: false,
+        reason: isNotFoundText(text) ? 'not-found' : skipped !== null && skipped > 0 ? 'refused' : 'unknown',
+        message: text === '' ? '没有会话被删除' : text,
+      }
+    }
+    if (payload.success === true) return { ok: true, message: text === '' ? '已删除' : text }
+    if (payload.success === false) {
+      return {
+        ok: false,
+        reason: isNotFoundText(text) ? 'not-found' : 'refused',
+        message: text === '' ? '应用拒绝删除该会话' : text,
+      }
+    }
+  }
+  return null
+}
+
+function numberField(record: Record<string, unknown>, keys: string[]): number | null {
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+  }
+  return null
+}
+
+function countFor(text: string, pattern: RegExp): number | null {
+  const match = pattern.exec(text)
+  if (match === null) return null
+  const value = Number.parseInt(match[1] ?? '', 10)
+  return Number.isFinite(value) ? value : null
+}
+
+function isNotFoundText(text: string): boolean {
+  return /not found|no longer available|does not exist|不存在/i.test(text)
+}
+
+function hasErrorFlag(result: unknown): boolean {
+  if (!isRecord(result)) return false
+  if (result.isError === true) return true
+  return isRecord(result.result) && result.result.isError === true
+}
+
 export function invalidateSessionListCache(): void {
   cached = undefined
 }
 
-export type AppSessionDeps = Pick<EngineInterface, 'mcp' | 'tool'>
-
 export async function listAppSessions(
-  $: AppSessionDeps,
+  deps: AppSessionDeps,
   allowToolFallback = true,
 ): Promise<AppSessionRow[] | null> {
-  return listSessions($, allowToolFallback)
+  return listSessions(deps, allowToolFallback)
 }
 
 async function listSessions(
-  $: AppSessionDeps,
+  deps: AppSessionDeps,
   allowToolFallback = true,
 ): Promise<AppSessionRow[] | null> {
   const now = Date.now()
   if (cached !== undefined && now - cached.at < 15000) return cached.rows
 
   try {
-    const result = await $.mcp.call('ccd_session_mgmt', 'list_sessions', { limit: 200 })
+    const result = await deps.mcpCall('ccd_session_mgmt', 'list_sessions', { limit: 200 })
     // An error answer still leaves the tool door usable; only a well-formed
     // answer ends the search here.
     if (result.isError !== true) {
-      const content = result.content as Array<{ type?: unknown; text?: unknown }>
-      const text = content
-        .filter(block => block.type === 'text' && typeof block.text === 'string')
-        .map(block => String(block.text ?? ''))
-        .join('')
-      if (text !== '') {
-        const rows = parseRows(text)
-        if (rows !== null) {
-          cached = { at: now, rows }
-          return rows
-        }
+      const rows = rowsOf(result)
+      if (rows !== null) {
+        cached = { at: now, rows }
+        return rows
       }
     }
   } catch {
@@ -217,12 +334,14 @@ async function listSessions(
   // out of it; only a click the person started uses this fallback.
   if (!allowToolFallback) return null
   try {
-    const result = await $.tool.call({
+    const result = await deps.toolCall({
       tool: 'mcp__ccd_session_mgmt__list_sessions',
       limit: 200,
-    }) as { text?: unknown; result?: unknown }
-    const text = typeof result.text === 'string' ? result.text : JSON.stringify(result.result ?? '')
-    const rows = parseRows(text)
+    })
+    if (hasErrorFlag(result)) return null
+    const text = mcpResultText(result)
+    let rows = text === '' ? null : rowsOf(text)
+    if (rows === null && isRecord(result)) rows = rowsOf(result.result)
     if (rows === null) return null
     cached = { at: now, rows }
     return rows
@@ -231,35 +350,31 @@ async function listSessions(
   }
 }
 
-function parseRows(text: string): AppSessionRow[] | null {
-  if (text === '') return null
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(text)
-  } catch {
-    return null
+/**
+ * Reads a session list from any of the wrappers the two doors use: a JSON
+ * string, `{ content: [{ type: "text", text }] }`, a nested `result`, or an
+ * array / `{ sessions }` object already parsed.
+ */
+function rowsOf(payload: unknown): AppSessionRow[] | null {
+  if (typeof payload === 'string') {
+    const parsed = parseJson(payload)
+    return parsed === null ? null : rowsOf(parsed)
   }
-  if (parsed !== null && typeof parsed === 'object' && Array.isArray((parsed as { content?: unknown }).content)) {
-    const blocks = (parsed as { content: Array<{ type?: unknown; text?: unknown }> }).content
-    return parseRows(
-      blocks
-        .filter(block => block.type === 'text' && typeof block.text === 'string')
-        .map(block => String(block.text ?? ''))
-        .join(''),
-    )
+  if (Array.isArray(payload)) return payload.filter(isRecord)
+  if (!isRecord(payload)) return null
+  if (Array.isArray(payload.sessions)) return payload.sessions.filter(isRecord)
+  if (Array.isArray(payload.content)) {
+    const text = textBlocks(payload.content)
+    return text === '' ? null : rowsOf(text)
   }
-  const rows = Array.isArray(parsed)
-    ? parsed
-    : parsed !== null && typeof parsed === 'object' && Array.isArray((parsed as { sessions?: unknown }).sessions)
-      ? (parsed as { sessions: unknown[] }).sessions
-      : null
-  if (rows === null) return null
-  return rows.filter(
-    (row): row is AppSessionRow => row !== null && typeof row === 'object',
-  )
+  return null
 }
 
-async function openUrl($: EngineInterface, url: string): Promise<boolean> {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+async function openUrl(deps: AppSessionDeps, url: string): Promise<boolean> {
   if (!isClaudeLink(url)) return false
 
   const attempts: string[][] = [
@@ -269,7 +384,7 @@ async function openUrl($: EngineInterface, url: string): Promise<boolean> {
   ]
   for (const argv of attempts) {
     try {
-      const result = await $.process.run(argv, { timeoutMs: 5000 })
+      const result = await deps.processRun(argv, { timeoutMs: 5000 })
       if (result.exitCode === 0) return true
     } catch {
       // The opener does not exist here; try the next one.
@@ -278,9 +393,9 @@ async function openUrl($: EngineInterface, url: string): Promise<boolean> {
   return false
 }
 
-async function safeCwd($: EngineInterface): Promise<string | null> {
+async function safeCwd(deps: AppSessionDeps): Promise<string | null> {
   try {
-    return await $.session.cwd()
+    return await deps.sessionCwd()
   } catch {
     return null
   }

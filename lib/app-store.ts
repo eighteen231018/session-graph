@@ -1,4 +1,5 @@
-import type { EngineInterface, FsEntry } from 'claude-code'
+import type { FsEntry } from 'claude-code'
+import type { HostDeps } from './host'
 
 /**
  * One session as the desktop app stores it. The app keeps a session's
@@ -24,7 +25,7 @@ export type AppSessionScan = {
   deletedTranscriptIds: Set<string>
 }
 
-export type AppStoreDeps = Pick<EngineInterface, 'fs' | 'env'>
+export type AppStoreDeps = Pick<HostDeps, 'env' | 'fsExists' | 'fsList' | 'fsRead'>
 
 type CachedRecord = {
   mtimeMs: number
@@ -64,25 +65,25 @@ export function forgetAppSession(appId: string, transcriptIds?: Iterable<string>
  * transcript-only view.
  */
 /** Tombstone ids only, for the 1s change watch (no record reads). */
-export async function listDeletedTranscriptIds($: AppStoreDeps): Promise<string[]> {
+export async function listDeletedTranscriptIds(deps: AppStoreDeps): Promise<string[]> {
   let stores: string[] = []
   try {
-    stores = await findStoreRoots($)
+    stores = await findStoreRoots(deps)
   } catch {
     return []
   }
   const ids: string[] = []
   for (const store of stores) {
-    const found = await findStoreEntries($, store)
+    const found = await findStoreEntries(deps, store)
     ids.push(...found.tombstones)
   }
   return [...new Set(ids)]
 }
 
-export async function scanAppSessions($: AppStoreDeps): Promise<AppSessionScan> {
+export async function scanAppSessions(deps: AppStoreDeps): Promise<AppSessionScan> {
   let stores: string[] = []
   try {
-    stores = await findStoreRoots($)
+    stores = await findStoreRoots(deps)
   } catch {
     return { records: [], deletedTranscriptIds: new Set() }
   }
@@ -90,21 +91,29 @@ export async function scanAppSessions($: AppStoreDeps): Promise<AppSessionScan> 
   const deletedTranscriptIds = new Set<string>()
   const seenPaths = new Set<string>()
   const seenIds = new Set<string>()
+  const freshTombstones = new Set<string>()
 
   for (const store of stores) {
-    const found = await findStoreEntries($, store)
-    for (const tombstone of found.tombstones) {
-      deletedTranscriptIds.add(tombstone)
-      seenTombstones.add(tombstone)
-    }
+    const found = await findStoreEntries(deps, store)
+    for (const tombstone of found.tombstones) freshTombstones.add(tombstone)
     for (const file of found.records) {
       if (seenPaths.has(file.path)) continue
       seenPaths.add(file.path)
-      const record = await readRecord($, file.path, file.entry)
+      const record = await readRecord(deps, file.path, file.entry)
       if (record === null || seenIds.has(record.id)) continue
       seenIds.add(record.id)
       records.push(record)
     }
+  }
+
+  // A tombstone names one id, but the app record it belonged to may own
+  // several CLI transcripts. Expand through the records the previous scan
+  // knew before they are replaced; an id the host deleted can then never come
+  // back as a card through a transcript the record also listed.
+  const expanded = expandTombstones(freshTombstones, knownRecords)
+  for (const id of expanded) {
+    deletedTranscriptIds.add(id)
+    seenTombstones.add(id)
   }
 
   for (const key of cache.keys()) {
@@ -119,6 +128,20 @@ export async function scanAppSessions($: AppStoreDeps): Promise<AppSessionScan> 
   return { records, deletedTranscriptIds }
 }
 
+function expandTombstones(ids: Iterable<string>, known: AppSessionRecord[]): Set<string> {
+  const out = new Set<string>()
+  for (const id of ids) {
+    out.add(id)
+    const record = known.find(candidate =>
+      candidate.id === id || candidate.transcriptIds.includes(id),
+    )
+    if (record === undefined) continue
+    out.add(record.id)
+    for (const transcriptId of record.transcriptIds) out.add(transcriptId)
+  }
+  return out
+}
+
 type RecordFile = {
   path: string
   entry: FsEntry
@@ -129,7 +152,7 @@ type StoreEntries = {
   tombstones: string[]
 }
 
-async function findStoreEntries($: AppStoreDeps, store: string): Promise<StoreEntries> {
+async function findStoreEntries(deps: AppStoreDeps, store: string): Promise<StoreEntries> {
   const records: RecordFile[] = []
   const tombstones: string[] = []
   let frontier = [store]
@@ -139,7 +162,7 @@ async function findStoreEntries($: AppStoreDeps, store: string): Promise<StoreEn
     for (const dir of frontier) {
       if (visited >= MAX_RECORDS || records.length >= MAX_RECORDS) break
       visited += 1
-      const entries = await listEntries($, dir)
+      const entries = await listEntries(deps, dir)
       for (const entry of entries) {
         if (entry.kind === 'dir') {
           next.push(`${dir}/${entry.name}`)
@@ -158,33 +181,33 @@ async function findStoreEntries($: AppStoreDeps, store: string): Promise<StoreEn
   return { records, tombstones }
 }
 
-async function findStoreRoots($: AppStoreDeps): Promise<string[]> {
+async function findStoreRoots(deps: AppStoreDeps): Promise<string[]> {
   const now = Date.now()
   if (rootsCache !== undefined && now - rootsCache.at < 60_000) return rootsCache.roots
 
   const bases = new Set<string>()
-  const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE'))
+  const home = deps.env.home ?? deps.env.userProfile
   if (home !== undefined && home !== '') {
     bases.add(`${trimSlash(home)}/Library/Application Support`)
     bases.add(`${trimSlash(home)}/.config`)
   }
   for (const value of [
-    await $.env.get('APPDATA'),
-    await $.env.get('LOCALAPPDATA'),
-    await $.env.get('XDG_CONFIG_HOME'),
+    deps.env.appData,
+    deps.env.localAppData,
+    deps.env.xdgConfigHome,
   ]) {
     if (value !== undefined && value !== '') bases.add(trimSlash(value))
   }
 
   const roots: string[] = []
   for (const base of bases) {
-    const entries = await listEntries($, base)
+    const entries = await listEntries(deps, base)
     for (const entry of entries) {
       if (entry.kind !== 'dir') continue
       if (!/^claude(?:$|[- ._].*)/i.test(entry.name)) continue
       const candidate = `${base}/${entry.name}/claude-code-sessions`
       try {
-        if (await $.fs.exists(candidate)) roots.push(candidate)
+        if (await deps.fsExists(candidate)) roots.push(candidate)
       } catch {
         // Not a profile with a session store.
       }
@@ -195,21 +218,25 @@ async function findStoreRoots($: AppStoreDeps): Promise<string[]> {
   return unique
 }
 
-async function listEntries($: AppStoreDeps, path: string): Promise<FsEntry[]> {
+async function listEntries(deps: AppStoreDeps, path: string): Promise<FsEntry[]> {
   try {
-    return await $.fs.list(path)
+    return await deps.fsList(path)
   } catch {
     return []
   }
 }
 
-async function readRecord($: AppStoreDeps, path: string, entry: FsEntry): Promise<AppSessionRecord | null> {
+async function readRecord(
+  deps: AppStoreDeps,
+  path: string,
+  entry: FsEntry,
+): Promise<AppSessionRecord | null> {
   const cached = cache.get(path)
   if (cached !== undefined && cached.mtimeMs === entry.mtimeMs) return cached.record
 
   let text = ''
   try {
-    text = await $.fs.read(path)
+    text = await deps.fsRead(path)
   } catch {
     return null
   }
