@@ -1,0 +1,6 @@
+{
+  "name": "session-graph",
+  "version": "0.1.2",
+  "description": "Visualize session forks and branches as clickable cards with tree connectors in a side pane.",
+  "types": "./types/index.d.ts"
+}

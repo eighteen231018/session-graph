@@ -1,0 +1,561 @@
+import { atom, read, update } from 'claude-code'
+import type { EngineInterface, Register, RenderElement, Timer } from 'claude-code'
+import type { BranchCard, GraphSnapshot } from '../types'
+import { forgetAppSession } from '../lib/app-store'
+import { collectGraph, listSessionIds } from '../lib/collect'
+import { layoutCardTree } from '../lib/tree'
+import { exportHtml } from '../lib/export'
+import { deleteAppSession, openSession } from '../lib/session-link'
+
+const PANE = 'session-graph'
+
+const EMPTY: GraphSnapshot = {
+  nodes: [],
+  sessions: [],
+  cards: [],
+  source: 'transcript',
+  scannedAt: 0,
+  theme: 'dark',
+  hiddenNodeCount: 0,
+}
+
+const snapshotAtom = atom({ plugin: 'session-graph', key: 'snapshot' } as const, EMPTY)
+
+let pollTimer: Timer | undefined
+let watchTimer: Timer | undefined
+let knownIds: string | null = null
+let watching = false
+let scanning = false
+let lastScanAt = 0
+let lastSignature = ''
+let lastRenderLog = ''
+const deletingCards = new Set<string>()
+
+async function refresh($: EngineInterface, force = false): Promise<GraphSnapshot | null> {
+  if (scanning) return null
+  const now = Date.now()
+  if (!force && now - lastScanAt < 1200) return null
+
+  scanning = true
+  try {
+    const snapshot = await collectGraph($)
+    const signature = signatureOf(snapshot)
+    if (force || signature !== lastSignature) {
+      await update($, snapshotAtom, () => snapshot)
+      lastSignature = signature
+      void retitlePane($, snapshot)
+    }
+    lastScanAt = now
+    return snapshot
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    $.ui.log(`session-graph: scan failed: ${message}`, { to: 'debug' })
+    try {
+      const current = await read($, snapshotAtom)
+      await update($, snapshotAtom, () => ({
+        ...current,
+        notice: `扫描失败：${message}`,
+        scannedAt: Date.now(),
+      }))
+    } catch {
+      // The pane keeps its previous drawing.
+    }
+    return null
+  } finally {
+    scanning = false
+  }
+}
+
+async function watchSessionSet($: EngineInterface): Promise<void> {
+  if (watching) return
+  watching = true
+  try {
+    const ids = await listSessionIds($)
+    if (ids === null) return
+    const key = [...ids].sort().join('|')
+    if (knownIds === null) {
+      knownIds = key
+      return
+    }
+    if (key === knownIds) return
+    const snapshot = await refresh($, true)
+    if (snapshot !== null) knownIds = key
+  } finally {
+    watching = false
+  }
+}
+
+export const register: Register = on => {
+  on('session.start', async ($, e, next) => {
+    await $.command.register({
+      name: 'session-graph',
+      description: 'Show session branches as clickable cards in a side pane',
+      argumentHint: '[open|close|refresh|export|focus]',
+    })
+
+    pollTimer?.cancel()
+    pollTimer = $.clock.every(5000, () => {
+      void refresh($)
+    })
+    knownIds = null
+    watchTimer?.cancel()
+    watchTimer = $.clock.every(1000, () => {
+      void watchSessionSet($)
+    })
+    // Establish the baseline before the first full scan, so a deletion during
+    // the scan is still detected by the next comparison.
+    await watchSessionSet($)
+    void refresh($, true)
+
+    if (e.isInteractive) {
+      $.clock.after(800, () => {
+        void (async () => {
+          try {
+            const surfaces = await $.session.surfaces()
+            if (surfaces.includes('desktop')) {
+              const current = cardsOf(await read($, snapshotAtom)).find(card => card.isCurrent)
+              await $.ui.open({
+                id: PANE,
+                title: current === undefined ? '会话分支图谱' : `分支树 · ${current.title}`,
+              })
+            }
+          } catch {
+            // No surface places panes; the command still opens it later.
+          }
+        })()
+      })
+    }
+
+    return next(e)
+  })
+
+  on('session.end', ($, e, next) => {
+    pollTimer?.cancel()
+    pollTimer = undefined
+    watchTimer?.cancel()
+    watchTimer = undefined
+    knownIds = null
+    return next(e)
+  })
+
+  on('command.run', { command: 'session-graph' }, async ($, e) => {
+    const argument = e.args.trim().toLowerCase()
+
+    if (argument === 'close') {
+      await $.ui.close({ id: PANE })
+      return { text: '会话分支图谱面板已关闭。' }
+    }
+
+    const snapshot = (await refresh($, true)) ?? (await read($, snapshotAtom))
+
+    if (argument === 'export') {
+      const result = await runExport($, snapshot, false)
+      return { text: result.text }
+    }
+
+    const current = cardsOf(snapshot).find(card => card.isCurrent)
+    const opened = await $.ui.open({
+      id: PANE,
+      title: current === undefined ? '会话分支图谱' : `分支树 · ${current.title}`,
+      ...(argument === 'focus' ? { focus: true as const } : {}),
+    })
+    return {
+      text: opened.isPlaced
+        ? '会话分支图谱已打开。'
+        : `面板暂未显示：${opened.reason}（可在更宽的窗口重试）`,
+    }
+  })
+
+  on('prompt.submit', async ($, e, next) => {
+    const command = e.command?.name
+    if (command === 'fork' || command === 'branch' || command === 'clear') {
+      $.clock.after(1200, () => {
+        void refresh($, true)
+      })
+    }
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    $.clock.after(500, () => {
+      void refresh($)
+    })
+    return result
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const snapshot = await read($, snapshotAtom)
+    const cards = cardsOf(snapshot)
+    const titleById = new Map(cards.map(card => [card.sessionId, card.title]))
+    const cardById = new Map(cards.map(card => [card.sessionId, card]))
+    const columns = typeof e.props?.bodyColumns === 'number' && e.props.bodyColumns > 0
+      ? e.props.bodyColumns
+      : (e.viewport?.columns ?? 80)
+    const layout = layoutCardTree(cards, columns)
+    const treeCards = cards.flatMap(card => {
+      const position = layout.positions.get(card.sessionId)
+      if (position === undefined) return []
+      return [{
+        sessionId: card.sessionId,
+        title: (card.isCurrent ? '★ ' : '') + card.title,
+        meta: cardMeta(card, titleById),
+        body: card.firstUserMessage,
+        isCurrent: card.isCurrent,
+        x: position.x,
+        y: position.y,
+        width: position.width,
+        height: position.height,
+      }]
+    })
+    const lineColor = snapshot.theme === 'light' ? '#0969da' : '#79c0ff'
+    const renderKey = `${e.surface}:cards=${treeCards.length}:edges=${layout.edges.length}:size=${layout.width}x${layout.height}:cols=${columns}`
+    if (renderKey !== lastRenderLog) {
+      lastRenderLog = renderKey
+      $.ui.log(`session-graph: render ${renderKey}`)
+    }
+
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const byRow = new Map<number, typeof treeCards>()
+    for (const card of treeCards) {
+      const row = Math.max(0, Math.floor(card.y))
+      const list = byRow.get(row)
+      if (list === undefined) byRow.set(row, [card])
+      else list.push(card)
+    }
+    const lineCells = (row: number): number[] => {
+      const cells = new Set<number>()
+      for (const edge of layout.edges) {
+        if (row < edge.y || row >= edge.y + edge.height) continue
+        const start = Math.max(0, Math.floor(edge.x))
+        const end = Math.min(layout.width, Math.floor(edge.x + edge.width))
+        for (let x = start; x < end; x += 1) cells.add(x)
+      }
+      return [...cells].sort((a, b) => a - b)
+    }
+    const open = (sessionId: string): void => {
+      const card = cardById.get(sessionId)
+      if (card !== undefined) void openCard($, card)
+    }
+    const remove = (sessionId: string): void => {
+      const card = cardById.get(sessionId)
+      if (card !== undefined) {
+        $.clock.after(1, () => { void deleteCard($, card) })
+      }
+    }
+
+    const rows: RenderElement[] = []
+    let row = 0
+    while (row < layout.height) {
+      const rowCards = byRow.get(row)
+      if (rowCards !== undefined && rowCards.length > 0) {
+        const children: RenderElement[] = []
+        let cursor = 0
+        for (const card of rowCards) {
+          const left = Math.max(0, Math.min(Math.floor(card.x), Math.max(0, layout.width - 1)))
+          const width = Math.max(1, Math.min(Math.floor(card.width), layout.width - left))
+          if (left > cursor) {
+            children.push(<Box key={`space:${row}:${card.sessionId}`} width={left - cursor} />)
+          }
+          const inner = Math.max(6, width - 4)
+          children.push(
+            <Box
+              key={card.sessionId}
+              width={width}
+              height={9}
+              flexShrink={0}
+              paddingX={1}
+              borderStyle={card.isCurrent ? 'double' : 'round'}
+              flexDirection="column"
+              overflow="hidden"
+            >
+              <Button key={`${card.sessionId}:title`} plain onPress={() => open(card.sessionId)}>
+                <Text weight="semibold">{fitText(card.title, inner)}</Text>
+              </Button>
+              <Text dimColor>{fitText(card.meta, inner)}</Text>
+              <Button key={`${card.sessionId}:body`} plain onPress={() => open(card.sessionId)}>
+                <Text>{fitText(card.body, inner * 4)}</Text>
+              </Button>
+              <Box flexDirection="row" gap={1}>
+                {card.isCurrent ? (
+                  <Text dimColor>当前</Text>
+                ) : (
+                  <Button key={`${card.sessionId}:open`} plain onPress={() => open(card.sessionId)}>打开</Button>
+                )}
+                <Button key={`${card.sessionId}:delete`} plain dimColor={card.isCurrent} onPress={() => remove(card.sessionId)}>删除</Button>
+              </Box>
+            </Box>,
+          )
+          cursor = left + width
+        }
+        if (cursor < layout.width) {
+          children.push(<Box key={`space:end:${row}`} width={layout.width - cursor} />)
+        }
+        rows.push(
+          <Box key={`row:${row}`} flexDirection="row" width={layout.width} height={9}>{children}</Box>,
+        )
+        row += 9
+        continue
+      }
+
+      const cells = lineCells(row)
+      const children: RenderElement[] = []
+      let cursor = 0
+      let index = 0
+      while (index < cells.length) {
+        const start = cells[index]!
+        let end = start
+        while (index + 1 < cells.length && cells[index + 1] === end + 1) {
+          index += 1
+          end += 1
+        }
+        if (start > cursor) {
+          children.push(<Box key={`space:${row}:${start}`} width={start - cursor} />)
+        }
+        children.push(
+          <Box key={`line:${row}:${start}`} width={end - start + 1} height={1} backgroundColor={lineColor} />,
+        )
+        cursor = end + 1
+        index += 1
+      }
+      if (cursor < layout.width) {
+        children.push(<Box key={`space:end:${row}`} width={layout.width - cursor} />)
+      }
+      rows.push(
+        <Box key={`line-row:${row}`} flexDirection="row" width={layout.width} height={1}>{children}</Box>,
+      )
+      row += 1
+    }
+
+    return (
+      <Box flexDirection="column" gap={1}>
+        <Box flexDirection="row" gap={1} flexWrap="wrap">
+          <Button key="view-cards" variant="primary" onPress={() => { void refresh($, true) }}>卡片</Button>
+          <Button key="refresh" onPress={() => { void refresh($, true) }}>刷新</Button>
+          <Button
+            key="export"
+            onPress={() => {
+              void runExport($, snapshot, true)
+            }}
+          >
+            导出 HTML
+          </Button>
+          <Button
+            key="copy"
+            onPress={() => {
+              void $.ui.copy({ text: currentSessionId(snapshot), surface: e.surface })
+            }}
+          >
+            复制会话 ID
+          </Button>
+        </Box>
+
+        {snapshot.notice === undefined ? null : <Text dimColor>⚠ {snapshot.notice}</Text>}
+
+        {treeCards.length === 0 ? (
+          <Text dimColor>{snapshot.scannedAt === 0 ? '正在扫描会话转录…' : '暂无可显示的会话分支。'}</Text>
+        ) : (
+          <>
+            <Box flexDirection="column" width={layout.width} height={layout.height}>{rows}</Box>
+            <Text dimColor>{summaryLine(snapshot)} · 点击卡片标题或正文进入会话；删除按钮在卡片底部</Text>
+          </>
+        )}
+      </Box>
+    )
+  })
+}
+
+async function retitlePane($: EngineInterface, snapshot: GraphSnapshot): Promise<void> {
+  const current = cardsOf(snapshot).find(card => card.isCurrent)
+  if (current === undefined) return
+  try {
+    const panes = await $.ui.panes()
+    if (!panes.some(pane => pane.id === PANE)) return
+    await $.ui.open({ id: PANE, title: `分支树 · ${current.title}` })
+  } catch {
+    // The pane is gone or the title was refused; keep the old one.
+  }
+}
+
+async function runExport(
+  $: EngineInterface,
+  snapshot: GraphSnapshot,
+  notify: boolean,
+): Promise<{ ok: boolean; text: string }> {
+  try {
+    const path = await exportHtml($, snapshot)
+    $.ui.log(`session-graph: exported ${path}`)
+    if (notify) $.ui.toast('已导出静态视图')
+    return { ok: true, text: `已导出静态视图：${path}` }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    $.ui.log(`session-graph: export failed: ${message}`, { to: 'debug' })
+    if (notify) $.ui.toast('导出失败')
+    return { ok: false, text: `导出失败：${message}` }
+  }
+}
+
+function fitText(value: string, cells: number): string {
+  let used = 0
+  let out = ''
+  for (const char of value) {
+    const code = char.codePointAt(0) ?? 0
+    const step = code >= 0x2e80 ? 2 : 1
+    if (used + step > cells) return `${out}…`
+    out += char
+    used += step
+  }
+  return out
+}
+
+function signatureOf(snapshot: GraphSnapshot): string {
+  const last = snapshot.nodes[snapshot.nodes.length - 1]
+  return [
+    snapshot.source,
+    snapshot.nodes.length,
+    last?.nodeId ?? '',
+    last?.timestamp ?? 0,
+    snapshot.sessions.map(session => `${session.id}:${session.lastTimestamp}:${session.branchName}`).join(','),
+    cardsOf(snapshot).map(card => `${card.sessionId}:${card.title}:${card.ownMessageCount}:${card.lastTimestamp}`).join(','),
+    snapshot.hiddenNodeCount,
+    snapshot.notice ?? '',
+    snapshot.theme,
+  ].join('|')
+}
+
+let lastOpen: { sessionId: string; at: number } | undefined
+
+async function openCard($: EngineInterface, card: BranchCard): Promise<void> {
+  const now = Date.now()
+  if (lastOpen !== undefined && lastOpen.sessionId === card.sessionId && now - lastOpen.at < 600) return
+  lastOpen = { sessionId: card.sessionId, at: now }
+
+  if (card.isCurrent) {
+    $.ui.toast('这是当前会话')
+    return
+  }
+
+  const result = await openSession($, {
+    sessionId: card.sessionId,
+    title: card.matchTitle !== '' ? card.matchTitle : card.title,
+    isCurrent: card.isCurrent,
+    lastTimestamp: card.lastTimestamp,
+  })
+  if (result.opened) {
+    $.ui.toast(result.reason === 'constructed' ? `已尝试打开「${card.title}」` : `正在打开「${card.title}」`)
+    return
+  }
+  if (result.reason === 'current') {
+    $.ui.toast('这是当前会话')
+    return
+  }
+
+  try {
+    await $.ui.copy({ text: card.sessionId })
+    $.ui.toast(result.reason === 'no-link' ? '未能定位会话链接，已复制会话 ID' : '打开失败，已复制会话 ID')
+  } catch {
+    $.ui.toast(`无法打开，会话 ID：${card.sessionId.slice(0, 8)}`)
+  }
+}
+
+async function deleteCard($: EngineInterface, card: BranchCard): Promise<void> {
+  if (card.isCurrent) {
+    $.ui.toast('不能删除当前正在运行的会话')
+    return
+  }
+  if (deletingCards.has(card.sessionId)) return
+  deletingCards.add(card.sessionId)
+
+  try {
+    let answer = ''
+    try {
+      answer = await $.ui.ask(
+        `删除会话「${card.title}」？该操作不可恢复；若该会话有 worktree，应用会另行提示。确定继续吗？`,
+        ['取消', '删除'],
+      )
+    } catch {
+      return
+    }
+    if (answer !== '删除') return
+
+    const result = await deleteAppSession($, {
+      sessionId: card.sessionId,
+      title: card.matchTitle !== '' ? card.matchTitle : card.title,
+      isCurrent: false,
+      lastTimestamp: card.lastTimestamp,
+    })
+    if (!result.ok) {
+      // The card may outlive the app session (a transcript whose record is
+      // gone). Treat "already gone" as removed instead of leaving a card that
+      // errors on every click.
+      if (result.reason === 'not-found') {
+        hideDeletedCard($, card)
+        $.ui.toast(`会话「${card.title}」已不存在，已从树中移除`)
+        return
+      }
+      $.ui.toast(truncate(result.message, 180))
+      return
+    }
+
+    hideDeletedCard($, card)
+    $.ui.toast(`已删除「${card.title}」`)
+  } finally {
+    deletingCards.delete(card.sessionId)
+  }
+}
+
+function hideDeletedCard($: EngineInterface, card: BranchCard): void {
+  forgetAppSession(card.sessionId)
+  knownIds = null
+  void refresh($, true)
+  $.clock.after(700, () => {
+    void refresh($, true)
+  })
+  $.clock.after(2000, () => {
+    void refresh($, true)
+  })
+}
+
+function cardMeta(card: BranchCard, titles: Map<string, string>): string {
+  const counts = `本分支 ${card.ownMessageCount} 条 · 会话共 ${card.messageCount} 条`
+  const time = formatTime(card.lastTimestamp)
+  const lead = card.isCurrent ? '当前分支 · ' : ''
+  if (card.parentSessionId === null) return `${lead}根会话 · ${counts} · ${time}`
+  const parent = titles.get(card.parentSessionId) ?? `会话 ${card.parentSessionId.slice(0, 8)}`
+  const fork = card.forkAtPreview === null ? '' : ` · 分叉点：${truncate(card.forkAtPreview, 34)}`
+  return `${lead}从「${parent}」分出 · ${counts}${fork} · ${time}`
+}
+
+function formatTime(timestamp: number): string {
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return '—'
+  try {
+    return new Date(timestamp).toLocaleString('zh-CN', {
+      month: 'numeric',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    })
+  } catch {
+    return '—'
+  }
+}
+
+function truncate(value: string, limit: number): string {
+  return value.length > limit ? `${value.slice(0, Math.max(1, limit - 1))}…` : value
+}
+
+function cardsOf(snapshot: GraphSnapshot): BranchCard[] {
+  return Array.isArray(snapshot.cards) ? snapshot.cards : []
+}
+
+function currentSessionId(snapshot: GraphSnapshot): string {
+  return snapshot.sessions.find(session => session.isCurrent)?.id ?? ''
+}
+
+function summaryLine(snapshot: GraphSnapshot): string {
+  const forks = snapshot.nodes.filter(node => node.type === 'fork').length
+  const messages = snapshot.nodes.length - forks
+  const source = snapshot.source === 'transcript' ? '转录树' : '线性降级'
+  return `${cardsOf(snapshot).length} 个分支 · ${messages} 条消息 · ${forks} 个分叉 · ${source}`
+}
