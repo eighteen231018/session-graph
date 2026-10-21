@@ -322,6 +322,7 @@ export const register: Register = on => {
             children.push(<Box key={`space:${row}:${card.sessionId}`} width={left - cursor} />)
           }
           const inner = Math.max(6, width - 4)
+          const hasChildren = cards.some(candidate => candidate.parentSessionId === card.sessionId)
           children.push(
             <Box
               key={card.sessionId}
@@ -355,7 +356,7 @@ export const register: Register = on => {
                     <Text color={normalColor}>打开</Text>
                   </Button>
                 )}
-                <Button key={`${card.sessionId}:delete`} plain dimColor={card.isCurrent} onPress={() => remove(card.sessionId)}>删除</Button>
+                <Button key={`${card.sessionId}:delete`} plain dimColor={card.isCurrent || hasChildren} onPress={() => remove(card.sessionId)}>删除</Button>
               </Box>
             </Box>,
           )
@@ -597,6 +598,24 @@ async function deleteCard($: EngineInterface, card: BranchCard): Promise<void> {
     $.ui.toast('不能删除当前正在运行的会话')
     return
   }
+
+  // A parent cannot be removed while branches still hang from it: the app
+  // would leave those children pointing at a missing parent. Ask the person
+  // to remove the children first instead of opening the delete dialog.
+  let children: BranchCard[] = []
+  try {
+    const snapshot = await read($, snapshotAtom)
+    children = cardsOf(snapshot).filter(candidate => candidate.parentSessionId === card.sessionId)
+  } catch {
+    children = []
+  }
+  if (children.length > 0) {
+    const names = children.slice(0, 3).map(child => `「${truncate(child.title, 18)}」`).join('、')
+    const more = children.length > 3 ? ' 等' : ''
+    $.ui.toast(`「${truncate(card.title, 18)}」还有 ${children.length} 个子分支（${names}${more}），无法删除；请先删除子分支`)
+    return
+  }
+
   if (deletingCards.has(card.sessionId)) return
   deletingCards.add(card.sessionId)
 
