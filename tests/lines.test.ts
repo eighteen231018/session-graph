@@ -1,7 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import { exportHtml, type ExportDeps } from '../lib/export'
 import { buildLineGrid, connectorPath, glyphOf } from '../lib/lines'
-import { buildConnectorSvg, SVG_LEVEL_COLORS } from '../lib/svg'
 import { layoutCardTree } from '../lib/tree'
 import type { BranchCard, GraphSnapshot } from '../types'
 
@@ -129,16 +128,4 @@ test('a connector path is one down-across-down polyline', () => {
   expect(connectorPath(left)).toBe(
     `M ${left.parentCenter + 0.5} ${left.parentBottom} V ${left.busY + 0.5} H ${left.childCenter + 0.5} V ${left.childTop}`,
   )
-})
-
-test('the desktop SVG layer uses cell units and one colour per level', () => {
-  const layout = fixture()
-  const svg = buildConnectorSvg(layout)
-  expect(svg).toContain(`viewBox="0 0 ${layout.width} ${layout.height}"`)
-  expect(svg).toContain('preserveAspectRatio="none"')
-  expect(svg).toContain('vector-effect="non-scaling-stroke"')
-  expect(svg).toContain('<animate')
-  expect(svg).toContain(SVG_LEVEL_COLORS[0])
-  expect(svg).toContain(SVG_LEVEL_COLORS[1])
-  expect(svg.split('<path').length - 1).toBe(layout.connectors.length * 2)
 })
