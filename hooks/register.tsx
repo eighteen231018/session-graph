@@ -5,6 +5,7 @@ import { forgetAppSession } from '../lib/app-store'
 import { collectGraph, listSessionIds } from '../lib/collect'
 import type { HostDeps } from '../lib/host'
 import { layoutCardTree } from '../lib/tree'
+import { buildLineGrid, glyphOf } from '../lib/lines'
 import { exportHtml } from '../lib/export'
 import { deleteAppSession, openSession } from '../lib/session-link'
 
@@ -61,6 +62,29 @@ let lastSignature = ''
 let lastRenderContent = ''
 let lastRenderViewport = ''
 const deletingCards = new Set<string>()
+let linePhase = 0
+let lineTimer: Timer | undefined
+let lastPaneRenderAt = 0
+
+// Theme keys rather than raw hex: every level keeps the person's own contrast
+// on both light and dark themes. Listed from level 1 down; deeper levels cycle.
+const LEVEL_COLORS = [
+  'suggestion',
+  'success',
+  'warning',
+  'permission',
+  'merged',
+  'planMode',
+  'ide',
+  'autoAccept',
+  'bashBorder',
+  'diffAdded',
+  'diffRemoved',
+  'claude',
+] as const
+const PULSE_SPAN = 9
+const PULSE_WIDTH = 2
+const LINE_FRAME_MS = 160
 
 type RefreshOutcome =
   | { status: 'ok'; snapshot: GraphSnapshot }
@@ -129,6 +153,22 @@ async function watchSessionSet($: EngineInterface): Promise<void> {
   }
 }
 
+function startLineAnimation($: EngineInterface): void {
+  lastPaneRenderAt = Date.now()
+  if (lineTimer !== undefined) return
+  lineTimer = $.clock.every(LINE_FRAME_MS, () => {
+    // A closed pane stops rendering, so stop invalidating once the last draw
+    // is old; opening it again starts a fresh timer.
+    if (Date.now() - lastPaneRenderAt > 3000) {
+      lineTimer?.cancel()
+      lineTimer = undefined
+      return
+    }
+    linePhase = (linePhase + 1) % (PULSE_SPAN * 12)
+    $.ui.invalidate('ui.render')
+  })
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -172,6 +212,8 @@ export const register: Register = on => {
     pollTimer = undefined
     watchTimer?.cancel()
     watchTimer = undefined
+    lineTimer?.cancel()
+    lineTimer = undefined
     knownIds = null
     return next(e)
   })
@@ -226,6 +268,7 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const snapshot = await read($, snapshotAtom)
+    startLineAnimation($)
     const cards = cardsOf(snapshot)
     const titleById = new Map(cards.map(card => [card.sessionId, card.title]))
     const cardById = new Map(cards.map(card => [card.sessionId, card]))
@@ -233,6 +276,7 @@ export const register: Register = on => {
       ? e.props.bodyColumns
       : (e.viewport?.columns ?? 80)
     const layout = layoutCardTree(cards, columns)
+    const lineGrid = buildLineGrid(layout)
     const treeCards = cards.flatMap(card => {
       const position = layout.positions.get(card.sessionId)
       if (position === undefined) return []
@@ -248,7 +292,6 @@ export const register: Register = on => {
         height: position.height,
       }]
     })
-    const lineColor = snapshot.theme === 'light' ? '#0969da' : '#79c0ff'
     // Theme keys resolve in the person's current theme on every surface. The
     // desktop app does not expose its theme row through `$.config.list()`, so
     // snapshot.theme falls back to dark there; raw colors would then be wrong
@@ -265,14 +308,14 @@ export const register: Register = on => {
     // debug log, and a redraw with neither change writes nothing.
     const contentKey = `${e.surface}|${cards.map(card =>
       `${card.sessionId}:${card.title}:${card.parentSessionId ?? '-'}:${card.isCurrent ? '1' : '0'}`,
-    ).join('|')}|${layout.edges.length}`
+    ).join('|')}|${layout.connectors.length}`
     const viewportKey = `${layout.width}x${layout.height}:${columns}`
     if (contentKey !== lastRenderContent) {
       const first = lastRenderContent === ''
       lastRenderContent = contentKey
       lastRenderViewport = viewportKey
       $.ui.log(
-        `session-graph: ${first ? '面板已绘制' : '面板已更新'}（${treeCards.length} 个分支 · ${layout.edges.length} 条连线 · ${layout.width}x${layout.height} 格）`,
+        `session-graph: ${first ? '面板已绘制' : '面板已更新'}（${treeCards.length} 个分支 · ${layout.connectors.length} 条连线 · ${layout.width}x${layout.height} 格）`,
       )
     } else if (viewportKey !== lastRenderViewport) {
       lastRenderViewport = viewportKey
@@ -287,16 +330,10 @@ export const register: Register = on => {
       if (list === undefined) byRow.set(row, [card])
       else list.push(card)
     }
-    const lineCells = (row: number): number[] => {
-      const cells = new Set<number>()
-      for (const edge of layout.edges) {
-        if (row < edge.y || row >= edge.y + edge.height) continue
-        const start = Math.max(0, Math.floor(edge.x))
-        const end = Math.min(layout.width, Math.floor(edge.x + edge.width))
-        for (let x = start; x < end; x += 1) cells.add(x)
-      }
-      return [...cells].sort((a, b) => a - b)
-    }
+    const lineColor = (level: number): string =>
+      LEVEL_COLORS[(Math.max(1, level) - 1) % LEVEL_COLORS.length]!
+    const pulseAt = (flow: number): boolean =>
+      ((flow - linePhase) % PULSE_SPAN + PULSE_SPAN) % PULSE_SPAN < PULSE_WIDTH
     const open = (sessionId: string): void => {
       const card = cardById.get(sessionId)
       if (card !== undefined) void openCard($, card)
@@ -372,29 +409,44 @@ export const register: Register = on => {
         continue
       }
 
-      const cells = lineCells(row)
       const children: RenderElement[] = []
       let cursor = 0
-      let index = 0
-      while (index < cells.length) {
-        const start = cells[index]!
-        let end = start
-        while (index + 1 < cells.length && cells[index + 1] === end + 1) {
-          index += 1
-          end += 1
+      let x = 0
+      const pushSpace = (to: number): void => {
+        if (to > cursor) {
+          children.push(<Box key={`space:${row}:${cursor}`} width={to - cursor} />)
         }
-        if (start > cursor) {
-          children.push(<Box key={`space:${row}:${start}`} width={start - cursor} />)
+      }
+      while (x < layout.width) {
+        const cell = lineGrid.cells.get(`${row}:${x}`)
+        if (cell === undefined) {
+          x += 1
+          continue
         }
+        const glyph = glyphOf(cell)
+        const pulse = pulseAt(cell.flow)
+        let run = ''
+        const start = x
+        while (x < layout.width) {
+          const next = lineGrid.cells.get(`${row}:${x}`)
+          if (
+            next === undefined ||
+            next.level !== cell.level ||
+            glyphOf(next) !== glyph ||
+            pulseAt(next.flow) !== pulse
+          ) break
+          run += glyphOf(next)
+          x += 1
+        }
+        pushSpace(start)
         children.push(
-          <Box key={`line:${row}:${start}`} width={end - start + 1} height={1} backgroundColor={lineColor} />,
+          pulse
+            ? <Text key={`line:${row}:${start}`} color={normalColor} weight="bold">{run}</Text>
+            : <Text key={`line:${row}:${start}`} color={lineColor(cell.level)}>{run}</Text>,
         )
-        cursor = end + 1
-        index += 1
+        cursor = x
       }
-      if (cursor < layout.width) {
-        children.push(<Box key={`space:end:${row}`} width={layout.width - cursor} />)
-      }
+      pushSpace(layout.width)
       rows.push(
         <Box key={`line-row:${row}`} flexDirection="row" width={layout.width} height={1}>{children}</Box>,
       )
@@ -669,13 +721,12 @@ function hideDeletedCard($: EngineInterface, card: BranchCard): void {
 }
 
 function cardMeta(card: BranchCard, titles: Map<string, string>): string {
-  const counts = `本分支 ${card.ownMessageCount} 条 · 会话共 ${card.messageCount} 条`
   const time = formatTime(card.lastTimestamp)
   const lead = card.isCurrent ? '当前分支 · ' : ''
-  if (card.parentSessionId === null) return `${lead}根会话 · ${counts} · ${time}`
+  if (card.parentSessionId === null) return `${lead}根会话 · ${time}`
   const parent = titles.get(card.parentSessionId) ?? `会话 ${card.parentSessionId.slice(0, 8)}`
   const fork = card.forkAtPreview === null ? '' : ` · 分叉点：${truncate(card.forkAtPreview, 34)}`
-  return `${lead}从「${parent}」分出 · ${counts}${fork} · ${time}`
+  return `${lead}从「${parent}」分出${fork} · ${time}`
 }
 
 function formatTime(timestamp: number): string {
@@ -706,8 +757,5 @@ function currentSessionId(snapshot: GraphSnapshot): string {
 }
 
 function summaryLine(snapshot: GraphSnapshot): string {
-  const forks = snapshot.nodes.filter(node => node.type === 'fork').length
-  const messages = snapshot.nodes.length - forks
-  const source = snapshot.source === 'transcript' ? '转录树' : '线性降级'
-  return `${cardsOf(snapshot).length} 个分支 · ${messages} 条消息 · ${forks} 个分叉 · ${source}`
+  return `${cardsOf(snapshot).length} 个分支`
 }

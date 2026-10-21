@@ -27,15 +27,26 @@ export async function exportHtml(deps: ExportDeps, snapshot: GraphSnapshot): Pro
   const muted = light ? '#6e7781' : '#8b949e'
   const normalBorder = light ? '#424a53' : '#ffffff'
   const cardBackground = light ? '#f6f8fa' : '#161b22'
-  const lineColor = light ? '#0969da' : '#79c0ff'
+  const levelColors = light
+    ? ['#0969da', '#1a7f37', '#9a6700', '#8250df', '#cf222e', '#1b7c83', '#bc4c00', '#bf3989', '#0550ae', '#116329', '#7d4e00', '#6639ba']
+    : ['#79c0ff', '#56d364', '#e3b341', '#d2a8ff', '#ff7b72', '#56d4dd', '#ffa657', '#ff9bce', '#a5d6ff', '#7ee787', '#f2cc60', '#e2c5ff']
   const accentColor = light ? '#c2410c' : '#ff9f0a'
   const scaleX = 8
   const scaleY = 16
 
   const titleById = new Map(cards.map(card => [card.sessionId, card.title]))
-  const edgeHtml = layout.edges.map(edge =>
-    `<div class="edge" style="left:${edge.x * scaleX}px;top:${edge.y * scaleY}px;width:${edge.width * scaleX}px;height:${edge.height * scaleY}px"></div>`,
-  ).join('')
+  const lineHtml = layout.connectors.map((connector, index) => {
+    const color = levelColors[(Math.max(1, connector.level) - 1) % levelColors.length]
+    const parentX = connector.parentCenter * scaleX + scaleX / 2
+    const childX = connector.childCenter * scaleX + scaleX / 2
+    const parentY = connector.parentBottom * scaleY
+    const busY = connector.busY * scaleY + scaleY / 2
+    const childY = connector.childTop * scaleY
+    const d = `M ${parentX} ${parentY} V ${busY} H ${childX} V ${childY}`
+    const delay = (-((index * 0.37) % 2.8)).toFixed(2)
+    return `<path class="connector" style="stroke:${color}" d="${d}" />` +
+      `<path class="flow" style="animation-delay:${delay}s" d="${d}" />`
+  }).join('')
 
   const cardsHtml = cards.map(card => {
     const position = layout.positions.get(card.sessionId)
@@ -46,7 +57,7 @@ export async function exportHtml(deps: ExportDeps, snapshot: GraphSnapshot): Pro
     const fork = card.forkAtPreview === null ? '' : ` · 分叉点：${escapeHtml(card.forkAtPreview.slice(0, 60))}`
     return `<article class="card${card.isCurrent ? ' current' : ''}" style="left:${position.x * scaleX}px;top:${position.y * scaleY}px;width:${position.width * scaleX}px;height:${position.height * scaleY}px">
   <h2>${card.isCurrent ? '★ ' : ''}${escapeHtml(card.title)}</h2>
-  <p class="meta">${parent} · 本分支 ${card.ownMessageCount} 条 · 会话共 ${card.messageCount} 条${fork}</p>
+  <p class="meta">${parent}${fork}</p>
   <p class="body">${escapeHtml(card.firstUserMessage)}</p>
   <p class="meta">会话 ID：<code>${escapeHtml(card.sessionId)}</code></p>
 </article>`
@@ -63,8 +74,12 @@ export async function exportHtml(deps: ExportDeps, snapshot: GraphSnapshot): Pro
   h1 { margin: 0 0 4px; font-size: 18px; font-weight: 600; }
   p { margin: 0 0 16px; color: ${muted}; }
   .tree { position: relative; margin: 0 auto; }
-  .edge { position: absolute; background: ${lineColor}; }
-  .card { position: absolute; box-sizing: border-box; overflow: hidden; border: 1px solid ${normalBorder}; border-radius: 10px; padding: 8px 10px; background: ${cardBackground}; }
+  .lines { position: absolute; inset: 0; overflow: visible; }
+  .connector { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; opacity: 0.55; }
+  .flow { fill: none; stroke: ${foreground}; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 9 35; animation: flow 2.8s linear infinite; }
+  @keyframes flow { from { stroke-dashoffset: 44; } to { stroke-dashoffset: 0; } }
+  @media (prefers-reduced-motion: reduce) { .flow { animation: none; opacity: 0.45; } }
+  .card { position: absolute; z-index: 1; box-sizing: border-box; overflow: hidden; border: 1px solid ${normalBorder}; border-radius: 10px; padding: 8px 10px; background: ${cardBackground}; }
   .card.current { border: 2px solid ${accentColor}; }
   .card.current h2, .card.current .body { color: ${accentColor}; }
   .card.current .meta { color: ${accentColor}; opacity: 0.85; }
@@ -79,10 +94,12 @@ export async function exportHtml(deps: ExportDeps, snapshot: GraphSnapshot): Pro
 <p>${cards.length} 个分支 · ${layout.width}×${layout.height} 格 · 生成于 ${new Date(snapshot.scannedAt).toLocaleString('zh-CN')}</p>
 ${snapshot.notice === undefined ? '' : `<p>⚠ ${escapeHtml(snapshot.notice)}</p>`}
 <div class="tree" style="width:${layout.width * scaleX}px;height:${layout.height * scaleY}px">
-${edgeHtml}
+<svg class="lines" width="${layout.width * scaleX}" height="${layout.height * scaleY}" viewBox="0 0 ${layout.width * scaleX} ${layout.height * scaleY}" aria-hidden="true">
+${lineHtml}
+</svg>
 ${cardsHtml}
 </div>
-<p class="note">静态导出不执行跳转；在插件 Pane 中点击卡片会尝试打开对应会话。父卡片居中于子卡片上方，连接线为竖—横—竖折线。</p>
+<p class="note">静态导出不执行跳转；在插件 Pane 中点击卡片会尝试打开对应会话。父卡片居中于子卡片上方，连接线按分支层级着色，亮色短线沿线流动。</p>
 <script type="application/json" id="session-graph-data">${data}</script>
 </body>
 </html>`

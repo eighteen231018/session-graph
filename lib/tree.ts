@@ -14,17 +14,19 @@ export type TreePosition = {
   height: number
 }
 
-export type TreeEdge = {
+export type TreeConnector = {
   key: string
-  x: number
-  y: number
-  width: number
-  height: number
+  parentCenter: number
+  childCenter: number
+  parentBottom: number
+  busY: number
+  childTop: number
+  level: number
 }
 
 export type CardTreeLayout = {
   positions: Map<string, TreePosition>
-  edges: TreeEdge[]
+  connectors: TreeConnector[]
   width: number
   height: number
   cardWidth: number
@@ -150,7 +152,7 @@ export function layoutCardTree(cards: BranchCard[], columns: number): CardTreeLa
     cursor += widthOf(root) + SIBLING_GAP
   }
 
-  const edges: TreeEdge[] = []
+  const connectors: TreeConnector[] = []
   for (const card of cards) {
     if (card.parentSessionId === null) continue
     const parent = positions.get(card.parentSessionId)
@@ -161,29 +163,16 @@ export function layoutCardTree(cards: BranchCard[], columns: number): CardTreeLa
     const childCenter = child.x + Math.floor(child.width / 2)
     const parentBottom = parent.y + parent.height
     const busY = parentBottom + Math.floor(LEVEL_GAP / 2)
-    const left = Math.min(parentCenter, childCenter)
-    const right = Math.max(parentCenter, childCenter)
+    const level = Math.round(child.y / (CARD_HEIGHT + LEVEL_GAP))
 
-    edges.push({
-      key: `${card.sessionId}:down`,
-      x: parentCenter,
-      y: parentBottom,
-      width: 1,
-      height: Math.max(1, busY - parentBottom),
-    })
-    edges.push({
-      key: `${card.sessionId}:across`,
-      x: left,
-      y: busY,
-      width: Math.max(1, right - left + 1),
-      height: 1,
-    })
-    edges.push({
-      key: `${card.sessionId}:up`,
-      x: childCenter,
-      y: busY,
-      width: 1,
-      height: Math.max(1, child.y - busY),
+    connectors.push({
+      key: card.sessionId,
+      parentCenter,
+      childCenter,
+      parentBottom,
+      busY,
+      childTop: child.y,
+      level,
     })
   }
 
@@ -196,7 +185,7 @@ export function layoutCardTree(cards: BranchCard[], columns: number): CardTreeLa
 
   return {
     positions,
-    edges,
+    connectors,
     width: Math.max(canvasWidth, maxX + 1),
     height: Math.max(1, maxY + 2),
     cardWidth,
