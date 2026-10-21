@@ -13,26 +13,41 @@
 
 ## 安装
 
-克隆仓库后，将插件目录传给 Claude Code：
+### Claude Code Desktop
+
+在 Code 会话中打开 `+` → **Plugins / Add plugins**，添加 marketplace：
+
+```text
+eighteen231018/session-graph-marketplace
+```
+
+然后在列表中选择 `session-graph` 安装。安装后可在 **Manage plugins** 中启用、禁用或卸载；更改后按界面提示重新加载插件，或重启会话。
+
+### CLI
+
+```bash
+claude plugin marketplace add eighteen231018/session-graph-marketplace
+claude plugin install session-graph@session-graph-marketplace
+```
+
+Claude Code 会自动克隆 marketplace 和插件仓库到本机插件缓存，之后可用 `claude plugin update session-graph` 更新。
+
+### 本地开发
+
+克隆仓库后，用 `--plugin-dir` 启动：
 
 ```bash
 git clone https://github.com/eighteen231018/session-graph.git
 claude --plugin-dir ./session-graph
 ```
 
-`--plugin-dir` 是 Claude Code CLI 的单次启动参数，适合本地试用和开发。它只会在这条命令启动的终端会话中加载插件。要停止使用，先按 `Ctrl+C` 退出当前会话，再不带插件参数启动：
+`--plugin-dir` 是 Claude Code CLI 的单次启动参数，只会在这条命令启动的终端会话中加载插件，适合本地试用和开发。要停止使用，先按 `Ctrl+C` 退出当前会话，再不带插件参数启动：
 
 ```bash
 claude
 ```
 
-不带 `--plugin-dir` 启动时不会加载这个本地插件，插件文件会保留。加载或更新插件后，在 Claude Code 中运行 `/reload-plugins`。
-
-### Claude Code Desktop
-
-直接点击 Claude Code Desktop 应用图标，不会使用上面的终端启动参数；仅打开本项目也不会自动加载此插件。要在 Desktop 中使用插件，请通过 Code 会话里的 `+` → **Plugins / Add plugins**，从已添加的 marketplace 安装，并在 **Manage plugins** 中启用。停止使用时，在同一处禁用或卸载插件；更改后按界面提示重新加载插件，或重启会话。
-
-当前仓库提供的是插件目录，没有包含 marketplace 清单。因此，`claude --plugin-dir ./session-graph` 这套本地试用方式适用于 CLI，不等同于 Desktop 插件管理器中的安装。若想从 Desktop 图标启动后使用，需要先将插件发布/加入一个 marketplace，再从 Desktop 的插件浏览器安装。不要把 `CLAUDE_CODE_PLUGIN_DIRS` 当作本插件的 Desktop 安装方式。
+不带 `--plugin-dir` 启动时不会加载这个本地插件，插件文件会保留。加载或更新插件后，在 Claude Code 中运行 `/reload-plugins`。不要把 `CLAUDE_CODE_PLUGIN_DIRS` 当作 Desktop 安装方式。
 
 ## 使用
 
