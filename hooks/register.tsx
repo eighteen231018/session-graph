@@ -268,7 +268,6 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const snapshot = await read($, snapshotAtom)
-    startLineAnimation($)
     const cards = cardsOf(snapshot)
     const titleById = new Map(cards.map(card => [card.sessionId, card.title]))
     const cardById = new Map(cards.map(card => [card.sessionId, card]))
@@ -277,6 +276,7 @@ export const register: Register = on => {
       : (e.viewport?.columns ?? 80)
     const layout = layoutCardTree(cards, columns)
     const lineGrid = buildLineGrid(layout)
+    if (layout.connectors.length > 0) startLineAnimation($)
     const treeCards = cards.flatMap(card => {
       const position = layout.positions.get(card.sessionId)
       if (position === undefined) return []
