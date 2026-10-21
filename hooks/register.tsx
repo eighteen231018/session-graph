@@ -55,28 +55,44 @@ let pollTimer: Timer | undefined
 let watchTimer: Timer | undefined
 let knownIds: string | null = null
 let watching = false
-let scanning = false
+let activeScan: Promise<RefreshOutcome> | null = null
 let lastScanAt = 0
 let lastSignature = ''
-let lastRenderLog = ''
+let lastRenderContent = ''
+let lastRenderViewport = ''
 const deletingCards = new Set<string>()
 
-async function refresh($: EngineInterface, force = false): Promise<GraphSnapshot | null> {
-  if (scanning) return null
-  const now = Date.now()
-  if (!force && now - lastScanAt < 1200) return null
+type RefreshOutcome =
+  | { status: 'ok'; snapshot: GraphSnapshot }
+  | { status: 'skipped' }
+  | { status: 'failed'; message: string }
 
-  scanning = true
+async function refresh($: EngineInterface, force = false): Promise<RefreshOutcome> {
+  // A scan already running is fresh enough for every caller; joining it also
+  // gives a manual refresh a real success/failure answer instead of "busy".
+  if (activeScan !== null) return activeScan
+  if (!force && Date.now() - lastScanAt < 1200) return { status: 'skipped' }
+
+  activeScan = scanOnce($)
+  try {
+    return await activeScan
+  } finally {
+    activeScan = null
+  }
+}
+
+async function scanOnce($: EngineInterface): Promise<RefreshOutcome> {
+  const now = Date.now()
   try {
     const snapshot = await collectGraph(await depsOf($))
     const signature = signatureOf(snapshot)
-    if (force || signature !== lastSignature) {
+    if (signature !== lastSignature) {
       await update($, snapshotAtom, () => snapshot)
       lastSignature = signature
       void retitlePane($, snapshot)
     }
     lastScanAt = now
-    return snapshot
+    return { status: 'ok', snapshot }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     $.ui.log(`session-graph: scan failed: ${message}`, { to: 'debug' })
@@ -90,9 +106,7 @@ async function refresh($: EngineInterface, force = false): Promise<GraphSnapshot
     } catch {
       // The pane keeps its previous drawing.
     }
-    return null
-  } finally {
-    scanning = false
+    return { status: 'failed', message }
   }
 }
 
@@ -108,8 +122,8 @@ async function watchSessionSet($: EngineInterface): Promise<void> {
       return
     }
     if (key === knownIds) return
-    const snapshot = await refresh($, true)
-    if (snapshot !== null) knownIds = key
+    const outcome = await refresh($, true)
+    if (outcome.status === 'ok') knownIds = key
   } finally {
     watching = false
   }
@@ -137,25 +151,19 @@ export const register: Register = on => {
     await watchSessionSet($)
     void refresh($, true)
 
-    if (e.isInteractive) {
-      $.clock.after(800, () => {
-        void (async () => {
-          try {
-            const surfaces = await $.session.surfaces()
-            if (surfaces.includes('desktop')) {
-              const current = cardsOf(await read($, snapshotAtom)).find(card => card.isCurrent)
-              await $.ui.open({
-                id: PANE,
-                title: current === undefined ? '会话分支图谱' : `分支树 · ${current.title}`,
-              })
-            }
-          } catch {
-            // No surface places panes; the command still opens it later.
-          }
-        })()
-      })
-    }
+    // A session opened in the app may start as interactive or be resumed by
+    // the desktop client; the surface, not isInteractive, decides whether a
+    // pane can be placed.
+    scheduleDesktopOpen($)
 
+    return next(e)
+  })
+
+  // Clicking a session in the desktop app attaches the desktop client to that
+  // session again. Open the pane on every attach, so switching sessions never
+  // needs a command.
+  on('session.attach', { surface: 'desktop' }, async ($, e, next) => {
+    scheduleDesktopOpen($, 250)
     return next(e)
   })
 
@@ -176,7 +184,9 @@ export const register: Register = on => {
       return { text: '会话分支图谱面板已关闭。' }
     }
 
-    const snapshot = (await refresh($, true)) ?? (await read($, snapshotAtom))
+    const outcome = await refresh($, true)
+    if (argument === 'refresh') toastRefreshOutcome($, outcome)
+    const snapshot = outcome.status === 'ok' ? outcome.snapshot : await read($, snapshotAtom)
 
     if (argument === 'export') {
       const result = await runExport($, snapshot, false)
@@ -239,10 +249,34 @@ export const register: Register = on => {
       }]
     })
     const lineColor = snapshot.theme === 'light' ? '#0969da' : '#79c0ff'
-    const renderKey = `${e.surface}:cards=${treeCards.length}:edges=${layout.edges.length}:size=${layout.width}x${layout.height}:cols=${columns}`
-    if (renderKey !== lastRenderLog) {
-      lastRenderLog = renderKey
-      $.ui.log(`session-graph: render ${renderKey}`)
+    // Theme keys resolve in the person's current theme on every surface. The
+    // desktop app does not expose its theme row through `$.config.list()`, so
+    // snapshot.theme falls back to dark there; raw colors would then be wrong
+    // on a light theme. `claude` is the theme's orange, `inactive` its border
+    // gray (dark gray on light, medium gray on dark), and `text` its
+    // foreground (white on dark, near-black on light).
+    const accentColor = 'claude'
+    const normalColor = 'text'
+    const normalBorderColor = 'inactive'
+    // Only tree-structure changes get a transcript line: a new branch, a
+    // deletion, a rename, the current marker moving. Ordinary message growth
+    // inside an existing branch is not a tree change. A redraw caused only by
+    // the pane's width — a sidebar resize, a window change — stays in the
+    // debug log, and a redraw with neither change writes nothing.
+    const contentKey = `${e.surface}|${cards.map(card =>
+      `${card.sessionId}:${card.title}:${card.parentSessionId ?? '-'}:${card.isCurrent ? '1' : '0'}`,
+    ).join('|')}|${layout.edges.length}`
+    const viewportKey = `${layout.width}x${layout.height}:${columns}`
+    if (contentKey !== lastRenderContent) {
+      const first = lastRenderContent === ''
+      lastRenderContent = contentKey
+      lastRenderViewport = viewportKey
+      $.ui.log(
+        `session-graph: ${first ? '面板已绘制' : '面板已更新'}（${treeCards.length} 个分支 · ${layout.edges.length} 条连线 · ${layout.width}x${layout.height} 格）`,
+      )
+    } else if (viewportKey !== lastRenderViewport) {
+      lastRenderViewport = viewportKey
+      $.ui.log(`session-graph: 视口变化 ${columns} 列 · 树 ${layout.width}x${layout.height} 格`, { to: 'debug' })
     }
 
     const { Box, Text, Button } = $.ui.resolve(e)
@@ -296,21 +330,30 @@ export const register: Register = on => {
               flexShrink={0}
               paddingX={1}
               borderStyle={card.isCurrent ? 'double' : 'round'}
+              borderColor={card.isCurrent ? accentColor : normalBorderColor}
               flexDirection="column"
               overflow="hidden"
             >
               <Button key={`${card.sessionId}:title`} plain onPress={() => open(card.sessionId)}>
-                <Text weight="semibold">{fitText(card.title, inner)}</Text>
+                <Text weight="semibold" color={card.isCurrent ? accentColor : normalColor}>
+                  {fitText(card.title, inner)}
+                </Text>
               </Button>
-              <Text dimColor>{fitText(card.meta, inner)}</Text>
+              <Text color={card.isCurrent ? accentColor : normalColor} dimColor={!card.isCurrent}>
+                {fitText(card.meta, inner)}
+              </Text>
               <Button key={`${card.sessionId}:body`} plain onPress={() => open(card.sessionId)}>
-                <Text>{fitText(card.body, inner * 4)}</Text>
+                <Text color={card.isCurrent ? accentColor : normalColor}>
+                  {fitText(card.body, inner * 4)}
+                </Text>
               </Button>
               <Box flexDirection="row" gap={1}>
                 {card.isCurrent ? (
-                  <Text dimColor>当前</Text>
+                  <Text color={accentColor}>当前</Text>
                 ) : (
-                  <Button key={`${card.sessionId}:open`} plain onPress={() => open(card.sessionId)}>打开</Button>
+                  <Button key={`${card.sessionId}:open`} plain onPress={() => open(card.sessionId)}>
+                    <Text color={normalColor}>打开</Text>
+                  </Button>
                 )}
                 <Button key={`${card.sessionId}:delete`} plain dimColor={card.isCurrent} onPress={() => remove(card.sessionId)}>删除</Button>
               </Box>
@@ -360,8 +403,8 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="row" gap={1} flexWrap="wrap">
-          <Button key="view-cards" variant="primary" onPress={() => { void refresh($, true) }}>卡片</Button>
-          <Button key="refresh" onPress={() => { void refresh($, true) }}>刷新</Button>
+          <Button key="view-cards" variant="primary" onPress={() => { void manualRefresh($) }}>卡片</Button>
+          <Button key="refresh" onPress={() => { void manualRefresh($) }}>刷新</Button>
           <Button
             key="export"
             onPress={() => {
@@ -393,6 +436,68 @@ export const register: Register = on => {
       </Box>
     )
   })
+}
+
+function toastRefreshOutcome($: EngineInterface, outcome: RefreshOutcome): void {
+  switch (outcome.status) {
+    case 'ok':
+      $.ui.toast(`刷新完成：${summaryLine(outcome.snapshot)}`)
+      return
+    case 'failed':
+      $.ui.toast(`刷新失败：${truncate(outcome.message, 120)}`)
+      return
+    case 'skipped':
+      $.ui.toast('刚刚已刷新，请稍后再试')
+      return
+  }
+}
+
+async function manualRefresh($: EngineInterface): Promise<void> {
+  toastRefreshOutcome($, await refresh($, true))
+}
+
+function scheduleDesktopOpen($: EngineInterface, delayMs = 800): void {
+  $.clock.after(delayMs, () => {
+    void openOnDesktop($)
+  })
+}
+
+async function openOnDesktop($: EngineInterface, attempt = 0): Promise<void> {
+  try {
+    const surfaces = await $.session.surfaces()
+    if (!surfaces.includes('desktop')) return
+  } catch {
+    return
+  }
+  const placed = await openPane($)
+  // A session that was just resumed may not draw its pane site yet; one retry
+  // covers that without reopening a pane the person deliberately closed later.
+  if (!placed && attempt === 0) {
+    $.clock.after(900, () => {
+      void openOnDesktop($, attempt + 1)
+    })
+  }
+}
+
+async function openPane($: EngineInterface): Promise<boolean> {
+  try {
+    const panes = await $.ui.panes()
+    if (panes.some(pane => pane.id === PANE)) return true
+  } catch {
+    // Cannot list panes; try opening anyway.
+  }
+  const snapshot = await read($, snapshotAtom)
+  const current = cardsOf(snapshot).find(card => card.isCurrent)
+  try {
+    const opened = await $.ui.open({
+      id: PANE,
+      title: current === undefined ? '会话分支图谱' : `分支树 · ${current.title}`,
+    })
+    return opened.isPlaced
+  } catch {
+    // No surface places panes; the command still opens it later.
+    return false
+  }
 }
 
 async function retitlePane($: EngineInterface, snapshot: GraphSnapshot): Promise<void> {

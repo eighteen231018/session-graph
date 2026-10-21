@@ -4,7 +4,8 @@
 
 ## 功能
 
-- 以树形卡片展示根会话和由 fork 创建的分支，并标记当前会话。
+- 以树形卡片展示根会话和由 fork 创建的分支；当前会话用主题橙色边框和文字，其他分支使用主题前景色和灰色边框。
+- 在 Claude Code Desktop 中新建、恢复或切换到某个会话时自动打开面板，无需输入命令。
 - 将同一 App 会话对应的多份 CLI 转录合并为一张卡片，避免 rewind、编辑重发或清空后出现重复分支。
 - 刷新图谱、复制当前会话 ID，并导出可离线查看的静态 HTML。
 - 在面板中删除会话前要求确认，并通过宿主的会话管理器执行删除。
@@ -19,7 +20,13 @@ git clone https://github.com/eighteen231018/session-graph.git
 claude --plugin-dir ./session-graph
 ```
 
-加载或更新插件后，在 Claude Code 中运行 `/reload-plugins`。
+此命令会在当前 Claude Code 会话中加载插件。要停止使用，先按 `Ctrl+C` 退出当前会话，再不带插件参数启动：
+
+```bash
+claude
+```
+
+不带 `--plugin-dir` 启动时不会加载这个本地插件，插件文件会保留。加载或更新插件后，在 Claude Code 中运行 `/reload-plugins`。
 
 ## 使用
 
@@ -31,7 +38,7 @@ claude --plugin-dir ./session-graph
 /session-graph close    关闭面板
 ```
 
-在面板中可以刷新图谱、导出 HTML、复制当前会话 ID，或打开和删除卡片对应的会话。Claude Code Desktop 的交互式会话会自动打开面板；其他情况可运行 `/session-graph` 手动打开。
+在面板中可以刷新图谱、导出 HTML、复制当前会话 ID，或打开和删除卡片对应的会话。Claude Code Desktop 中每次打开、恢复或切换到一个会话时都会自动打开面板，无需运行命令；关闭面板后，下一次切换到该会话时会再次打开。
 
 ## 数据与隐私
 

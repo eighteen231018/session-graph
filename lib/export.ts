@@ -25,9 +25,10 @@ export async function exportHtml(deps: ExportDeps, snapshot: GraphSnapshot): Pro
   const background = light ? '#ffffff' : '#0d1117'
   const foreground = light ? '#1f2328' : '#e6edf3'
   const muted = light ? '#6e7781' : '#8b949e'
-  const border = light ? '#d0d7de' : '#30363d'
+  const normalBorder = light ? '#424a53' : '#ffffff'
   const cardBackground = light ? '#f6f8fa' : '#161b22'
   const lineColor = light ? '#0969da' : '#79c0ff'
+  const accentColor = light ? '#c2410c' : '#ff9f0a'
   const scaleX = 8
   const scaleY = 16
 
@@ -63,8 +64,10 @@ export async function exportHtml(deps: ExportDeps, snapshot: GraphSnapshot): Pro
   p { margin: 0 0 16px; color: ${muted}; }
   .tree { position: relative; margin: 0 auto; }
   .edge { position: absolute; background: ${lineColor}; }
-  .card { position: absolute; box-sizing: border-box; overflow: hidden; border: 1px solid ${border}; border-radius: 10px; padding: 8px 10px; background: ${cardBackground}; }
-  .card.current { border: 2px solid #bf3989; }
+  .card { position: absolute; box-sizing: border-box; overflow: hidden; border: 1px solid ${normalBorder}; border-radius: 10px; padding: 8px 10px; background: ${cardBackground}; }
+  .card.current { border: 2px solid ${accentColor}; }
+  .card.current h2, .card.current .body { color: ${accentColor}; }
+  .card.current .meta { color: ${accentColor}; opacity: 0.85; }
   .card h2 { margin: 0 0 2px; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .card .meta { margin: 0 0 6px; color: ${muted}; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .card .body { margin: 0; white-space: pre-wrap; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; }
