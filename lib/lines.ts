@@ -1,4 +1,4 @@
-import type { CardTreeLayout } from './tree'
+import type { CardTreeLayout, TreeConnector } from './tree'
 
 export type LineCell = {
   x: number
@@ -136,4 +136,17 @@ export function buildLineGrid(layout: CardTreeLayout): LineGrid {
 export function glyphOf(cell: LineCell): string {
   const mask = `${cell.up ? 1 : 0}${cell.down ? 1 : 0}${cell.left ? 1 : 0}${cell.right ? 1 : 0}`
   return GLYPHS[mask] ?? '│'
+}
+
+/**
+ * The down-across-down path of one connector in the given unit, shared by the
+ * static export (pixels) and the desktop SVG overlay (cells).
+ */
+export function connectorPath(connector: TreeConnector, cellWidth = 1, cellHeight = 1): string {
+  const parentX = connector.parentCenter * cellWidth + cellWidth / 2
+  const childX = connector.childCenter * cellWidth + cellWidth / 2
+  const parentY = connector.parentBottom * cellHeight
+  const busY = connector.busY * cellHeight + cellHeight / 2
+  const childY = connector.childTop * cellHeight
+  return `M ${parentX} ${parentY} V ${busY} H ${childX} V ${childY}`
 }

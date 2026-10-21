@@ -29,8 +29,6 @@ export type CardTreeLayout = {
   connectors: TreeConnector[]
   width: number
   height: number
-  cardWidth: number
-  cardHeight: number
 }
 
 /**
@@ -188,7 +186,5 @@ export function layoutCardTree(cards: BranchCard[], columns: number): CardTreeLa
     connectors,
     width: Math.max(canvasWidth, maxX + 1),
     height: Math.max(1, maxY + 2),
-    cardWidth,
-    cardHeight: CARD_HEIGHT,
   }
 }

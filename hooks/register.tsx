@@ -6,6 +6,7 @@ import { collectGraph, listSessionIds } from '../lib/collect'
 import type { HostDeps } from '../lib/host'
 import { layoutCardTree } from '../lib/tree'
 import { buildLineGrid, glyphOf } from '../lib/lines'
+import { buildConnectorSvg } from '../lib/svg'
 import { exportHtml } from '../lib/export'
 import { deleteAppSession, openSession } from '../lib/session-link'
 
@@ -169,6 +170,11 @@ function startLineAnimation($: EngineInterface): void {
   })
 }
 
+function stopLineAnimation(): void {
+  lineTimer?.cancel()
+  lineTimer = undefined
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -212,8 +218,7 @@ export const register: Register = on => {
     pollTimer = undefined
     watchTimer?.cancel()
     watchTimer = undefined
-    lineTimer?.cancel()
-    lineTimer = undefined
+    stopLineAnimation()
     knownIds = null
     return next(e)
   })
@@ -275,8 +280,6 @@ export const register: Register = on => {
       ? e.props.bodyColumns
       : (e.viewport?.columns ?? 80)
     const layout = layoutCardTree(cards, columns)
-    const lineGrid = buildLineGrid(layout)
-    if (layout.connectors.length > 0) startLineAnimation($)
     const treeCards = cards.flatMap(card => {
       const position = layout.positions.get(card.sessionId)
       if (position === undefined) return []
@@ -322,7 +325,18 @@ export const register: Register = on => {
       $.ui.log(`session-graph: 视口变化 ${columns} 列 · 树 ${layout.width}x${layout.height} 格`, { to: 'debug' })
     }
 
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const elements = $.ui.resolve(e)
+    const { Box, Text, Button } = elements
+    const Svg = 'Svg' in elements ? elements.Svg : undefined
+    const connectorOverlay = Svg === undefined || layout.connectors.length === 0 ? null : (
+      <Box key="connectors" position="absolute" top={0} left={0} width={layout.width} height={layout.height}>
+        <Svg source={buildConnectorSvg(layout)} alt="会话分支连接线" isInteractive />
+      </Box>
+    )
+    const useConnectorSvg = connectorOverlay !== null
+    const lineGrid = useConnectorSvg ? undefined : buildLineGrid(layout)
+    if (useConnectorSvg) stopLineAnimation()
+    else if (layout.connectors.length > 0) startLineAnimation($)
     const byRow = new Map<number, typeof treeCards>()
     for (const card of treeCards) {
       const row = Math.max(0, Math.floor(card.y))
@@ -409,6 +423,13 @@ export const register: Register = on => {
         continue
       }
 
+      if (useConnectorSvg) {
+        rows.push(<Box key={`gap:${row}`} width={layout.width} height={1} />)
+        row += 1
+        continue
+      }
+
+      const grid = lineGrid!
       const children: RenderElement[] = []
       let cursor = 0
       let x = 0
@@ -418,7 +439,7 @@ export const register: Register = on => {
         }
       }
       while (x < layout.width) {
-        const cell = lineGrid.cells.get(`${row}:${x}`)
+        const cell = grid.cells.get(`${row}:${x}`)
         if (cell === undefined) {
           x += 1
           continue
@@ -428,7 +449,7 @@ export const register: Register = on => {
         let run = ''
         const start = x
         while (x < layout.width) {
-          const next = lineGrid.cells.get(`${row}:${x}`)
+          const next = grid.cells.get(`${row}:${x}`)
           if (
             next === undefined ||
             next.level !== cell.level ||
@@ -482,7 +503,10 @@ export const register: Register = on => {
           <Text dimColor>{snapshot.scannedAt === 0 ? '正在扫描会话转录…' : '暂无可显示的会话分支。'}</Text>
         ) : (
           <>
-            <Box flexDirection="column" width={layout.width} height={layout.height}>{rows}</Box>
+            <Box flexDirection="column" width={layout.width} height={layout.height}>
+              {connectorOverlay}
+              {rows}
+            </Box>
             <Text dimColor>{summaryLine(snapshot)} · 点击卡片标题或正文进入会话；删除按钮在卡片底部</Text>
           </>
         )}

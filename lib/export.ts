@@ -1,5 +1,6 @@
 import type { HostDeps } from './host'
 import type { GraphSnapshot } from '../types'
+import { connectorPath } from './lines'
 import { layoutCardTree } from './tree'
 
 export type ExportDeps = Pick<HostDeps, 'sessionId' | 'sessionCwd' | 'fsWrite'>
@@ -37,12 +38,7 @@ export async function exportHtml(deps: ExportDeps, snapshot: GraphSnapshot): Pro
   const titleById = new Map(cards.map(card => [card.sessionId, card.title]))
   const lineHtml = layout.connectors.map((connector, index) => {
     const color = levelColors[(Math.max(1, connector.level) - 1) % levelColors.length]
-    const parentX = connector.parentCenter * scaleX + scaleX / 2
-    const childX = connector.childCenter * scaleX + scaleX / 2
-    const parentY = connector.parentBottom * scaleY
-    const busY = connector.busY * scaleY + scaleY / 2
-    const childY = connector.childTop * scaleY
-    const d = `M ${parentX} ${parentY} V ${busY} H ${childX} V ${childY}`
+    const d = connectorPath(connector, scaleX, scaleY)
     const delay = (-((index * 0.37) % 2.8)).toFixed(2)
     return `<path class="connector" style="stroke:${color}" d="${d}" />` +
       `<path class="flow" style="animation-delay:${delay}s" d="${d}" />`
