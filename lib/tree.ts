@@ -37,7 +37,15 @@ export type CardTreeLayout = {
  * pair gets an orthogonal connector (down, across, down). Widths are measured
  * in terminal cells; the largest card width that fits the pane is chosen.
  */
-export function layoutCardTree(cards: BranchCard[], columns: number): CardTreeLayout {
+export function layoutCardTree(
+  cards: BranchCard[],
+  columns: number,
+  dimensions: { cardHeight?: number; levelGap?: number; minCardWidth?: number; maxCardWidth?: number } = {},
+): CardTreeLayout {
+  const cardHeight = Math.max(3, Math.floor(dimensions.cardHeight ?? CARD_HEIGHT))
+  const levelGap = Math.max(1, Math.floor(dimensions.levelGap ?? LEVEL_GAP))
+  const minCardWidth = Math.max(MIN_CARD_WIDTH, Math.floor(dimensions.minCardWidth ?? MIN_CARD_WIDTH))
+  const maxCardWidth = Math.max(minCardWidth, Math.floor(dimensions.maxCardWidth ?? MAX_CARD_WIDTH))
   const usableColumns = Math.max(24, Math.floor(columns))
   const byId = new Map(cards.map(card => [card.sessionId, card]))
   const children = new Map<string, BranchCard[]>()
@@ -78,8 +86,8 @@ export function layoutCardTree(cards: BranchCard[], columns: number): CardTreeLa
       + SIBLING_GAP * Math.max(0, roots.length - 1)
   }
 
-  let cardWidth = MIN_CARD_WIDTH
-  for (let candidate = MAX_CARD_WIDTH; candidate >= MIN_CARD_WIDTH; candidate -= 1) {
+  let cardWidth = minCardWidth
+  for (let candidate = maxCardWidth; candidate >= minCardWidth; candidate -= 1) {
     if (measure(candidate) + 2 <= usableColumns) {
       cardWidth = candidate
       break
@@ -110,7 +118,7 @@ export function layoutCardTree(cards: BranchCard[], columns: number): CardTreeLa
   const place = (card: BranchCard, left: number, depth: number): void => {
     const kids = children.get(card.sessionId) ?? []
     const total = widthOf(card)
-    const y = depth * (CARD_HEIGHT + LEVEL_GAP)
+    const y = depth * (cardHeight + levelGap)
 
     if (kids.length === 0) {
       positions.set(card.sessionId, {
@@ -118,7 +126,7 @@ export function layoutCardTree(cards: BranchCard[], columns: number): CardTreeLa
         x: left,
         y,
         width: cardWidth,
-        height: CARD_HEIGHT,
+        height: cardHeight,
       })
       return
     }
@@ -140,7 +148,7 @@ export function layoutCardTree(cards: BranchCard[], columns: number): CardTreeLa
       x,
       y,
       width: cardWidth,
-      height: CARD_HEIGHT,
+      height: cardHeight,
     })
   }
 
@@ -160,8 +168,8 @@ export function layoutCardTree(cards: BranchCard[], columns: number): CardTreeLa
     const parentCenter = parent.x + Math.floor(parent.width / 2)
     const childCenter = child.x + Math.floor(child.width / 2)
     const parentBottom = parent.y + parent.height
-    const busY = parentBottom + Math.floor(LEVEL_GAP / 2)
-    const level = Math.round(child.y / (CARD_HEIGHT + LEVEL_GAP))
+    const busY = parentBottom + Math.floor(levelGap / 2)
+    const level = Math.round(child.y / (cardHeight + levelGap))
 
     connectors.push({
       key: card.sessionId,

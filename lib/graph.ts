@@ -1,6 +1,6 @@
 import type { BranchCard, GraphNode, GraphSnapshot, SessionInfo } from '../types'
 import type { AppSessionRecord } from './app-store'
-import type { ParsedMessage } from './parse'
+import type { ParsedMessage, TranscriptForkOrigin, TranscriptBranchOrigin } from './parse'
 
 export type SessionFile = {
   id: string
@@ -9,6 +9,9 @@ export type SessionFile = {
   createdAt: number
   title?: string | undefined
   messages: ParsedMessage[]
+  forkOrigins?: TranscriptForkOrigin[]
+  continuedInSessionId?: string | undefined
+  branchOrigin?: TranscriptBranchOrigin | undefined
 }
 
 /**
@@ -24,6 +27,10 @@ type BranchUnit = {
   byUuid: Map<string, ParsedMessage>
   fileOfUuid: Map<string, string>
   uuidSet: Set<string>
+  foreignSessionIds: Map<string, number>
+  foreignIsPrefix: boolean
+  forkOrigins: TranscriptForkOrigin[]
+  branchOrigins: TranscriptBranchOrigin[]
   primary: SessionFile
   createdAt: number
   lastTimestamp: number
@@ -36,10 +43,11 @@ export function buildGraph(
   scannedAt: number,
   notice?: string,
   appSessions: AppSessionRecord[] = [],
+  options: { cliForkOrigins?: boolean; cliContinuations?: boolean } = {},
 ): GraphSnapshot {
-  const units = buildUnits(files, appSessions)
+  const units = buildUnits(files, appSessions, options.cliContinuations === true)
   const unitById = new Map(units.map(unit => [unit.id, unit]))
-  const parentOf = resolveUnitParents(units, unitById)
+  const parentOf = resolveUnitParents(units, unitById, options.cliForkOrigins === true)
   const used = selectUnits(units, parentOf, currentSessionId)
   const ordered = orderUnits(used, parentOf)
 
@@ -79,7 +87,7 @@ export function buildGraph(
   return snapshot
 }
 
-function buildUnits(files: SessionFile[], appSessions: AppSessionRecord[]): BranchUnit[] {
+function buildUnits(files: SessionFile[], appSessions: AppSessionRecord[], cliContinuations: boolean): BranchUnit[] {
   const recordOfTranscript = new Map<string, AppSessionRecord>()
   for (const record of appSessions) {
     for (const transcriptId of record.transcriptIds) {
@@ -93,10 +101,27 @@ function buildUnits(files: SessionFile[], appSessions: AppSessionRecord[]): Bran
     }
   }
 
+  // CLI resume/continuation can replace a transcript without creating a
+  // branch. Collapse only explicit links, never identical message histories.
+  // App ownership remains authoritative and cannot be merged by CLI metadata.
+  const cliFiles = new Map(files.filter(file => !recordOfTranscript.has(file.id)).map(file => [file.id, file]))
+  const continuationId = (file: SessionFile): string => {
+    if (!cliContinuations || !cliFiles.has(file.id)) return file.id
+    const seen = new Set<string>()
+    let current = file
+    for (;;) {
+      if (seen.has(current.id)) return file.id
+      seen.add(current.id)
+      const next = current.continuedInSessionId === undefined ? undefined : cliFiles.get(current.continuedInSessionId)
+      if (next === undefined) return current.id
+      current = next
+    }
+  }
+
   const units = new Map<string, BranchUnit>()
   for (const file of files) {
     const record = recordOfTranscript.get(file.id)
-    const id = record !== undefined ? record.id : file.id
+    const id = record !== undefined ? record.id : continuationId(file)
     let unit = units.get(id)
     if (unit === undefined) {
       unit = {
@@ -107,6 +132,10 @@ function buildUnits(files: SessionFile[], appSessions: AppSessionRecord[]): Bran
         byUuid: new Map(),
         fileOfUuid: new Map(),
         uuidSet: new Set(),
+        foreignSessionIds: new Map(),
+        foreignIsPrefix: false,
+        forkOrigins: [],
+        branchOrigins: [],
         primary: file,
         createdAt: record?.createdAt ?? file.createdAt,
         lastTimestamp: 0,
@@ -114,12 +143,16 @@ function buildUnits(files: SessionFile[], appSessions: AppSessionRecord[]): Bran
       units.set(id, unit)
     }
     unit.files.push(file)
+    for (const origin of file.forkOrigins ?? []) {
+      if (!unit.forkOrigins.some(existing => existing.markerUuid === origin.markerUuid)) unit.forkOrigins.push(origin)
+    }
+    if (file.branchOrigin !== undefined) unit.branchOrigins.push(file.branchOrigin)
     if (record?.createdAt !== undefined && record.createdAt > 0) unit.createdAt = record.createdAt
   }
 
   for (const unit of units.values()) {
-    const appCliId = unit.app?.cliSessionId
-    const liveFile = appCliId === undefined ? undefined : unit.files.find(file => file.id === appCliId)
+    const liveId = unit.app?.cliSessionId ?? (cliContinuations ? unit.id : undefined)
+    const liveFile = liveId === undefined ? undefined : unit.files.find(file => file.id === liveId)
     unit.primary = liveFile ?? unit.files.reduce(
       (best, file) => (file.mtimeMs > best.mtimeMs ? file : best),
       unit.files[0]!,
@@ -135,6 +168,35 @@ function buildUnits(files: SessionFile[], appSessions: AppSessionRecord[]): Bran
         merged.push(message)
       }
     }
+    // Inspect provenance before sorting: equal/missing timestamps must use
+    // transcript order, not the lexical order of randomly generated UUIDs.
+    const ownIds = new Set([
+      unit.id,
+      unit.app?.cliSessionId ?? '',
+      ...unit.files.map(file => file.id),
+      ...(unit.app?.transcriptIds ?? []),
+    ])
+    let firstOwnIndex = -1
+    for (const [index, message] of merged.entries()) {
+      if (message.sessionId === '' || !ownIds.has(message.sessionId)) continue
+      const first = merged[firstOwnIndex]
+      if (first === undefined || (message.timestamp > 0 && first.timestamp > 0 && message.timestamp < first.timestamp)) {
+        firstOwnIndex = index
+      }
+    }
+    const firstOwn = merged[firstOwnIndex]
+    unit.foreignIsPrefix = true
+    for (const [index, message] of merged.entries()) {
+      const owner = message.sessionId
+      if (owner === '' || ownIds.has(owner)) continue
+      unit.foreignSessionIds.set(owner, (unit.foreignSessionIds.get(owner) ?? 0) + 1)
+      if (firstOwn === undefined) continue
+      const orderedTimes = message.timestamp > 0 && firstOwn.timestamp > 0 && message.timestamp !== firstOwn.timestamp
+      if (orderedTimes ? message.timestamp > firstOwn.timestamp : index > firstOwnIndex) {
+        unit.foreignIsPrefix = false
+      }
+    }
+
     merged.sort((a, b) => a.timestamp - b.timestamp || (a.uuid < b.uuid ? -1 : 1))
     unit.messages = merged
 
@@ -161,8 +223,18 @@ function preferRecord(current: AppSessionRecord, candidate: AppSessionRecord, tr
   return (candidate.createdAt ?? 0) > (current.createdAt ?? 0) ? candidate : current
 }
 
-function resolveUnitParents(units: BranchUnit[], byId: Map<string, BranchUnit>): Map<string, string | null> {
+function resolveUnitParents(units: BranchUnit[], byId: Map<string, BranchUnit>, cliForkOrigins: boolean): Map<string, string | null> {
   const parentOf = new Map<string, string | null>()
+  const byTranscriptId = new Map<string, BranchUnit>()
+  for (const unit of units) {
+    for (const file of unit.files) byTranscriptId.set(file.id, unit)
+  }
+  for (const unit of units) {
+    // Prefer the ownership already resolved by buildUnits if records overlap.
+    for (const id of unit.app?.transcriptIds ?? []) {
+      if (!byTranscriptId.has(id)) byTranscriptId.set(id, unit)
+    }
+  }
 
   // The app's own fork links are exact. An app session without one is left to
   // history inference (older app builds did not always record the parent), and
@@ -180,11 +252,103 @@ function resolveUnitParents(units: BranchUnit[], byId: Map<string, BranchUnit>):
   }
   for (const unit of units) {
     if (parentOf.has(unit.id)) continue
-    parentOf.set(unit.id, inferParent(unit, units))
+    if (cliForkOrigins) {
+      const origin = cliOrigin(unit)
+      if (origin?.kind === 'branch') {
+        const parent = byTranscriptId.get(origin.parentSessionId)
+        parentOf.set(unit.id, parent !== undefined && !wouldCreateCycle(unit.id, parent.id, parentOf) ? parent.id : null)
+        continue
+      }
+    }
+    const parent = provenanceParent(unit, byTranscriptId, parentOf)
+    if (parent !== null) parentOf.set(unit.id, parent)
+  }
+
+  if (cliForkOrigins) {
+    for (const unit of units) {
+      if (parentOf.has(unit.id)) continue
+      const parent = notificationParent(unit, units, parentOf)
+      // A valid notification with ambiguous/missing sources stays unknown;
+      // message counts must not choose one of several identical candidates.
+      if (parent !== undefined) parentOf.set(unit.id, parent)
+    }
+  }
+
+  // Existing links establish direction before containment. Cycle detection
+  // excludes both direct children and deeper descendants as parent candidates.
+  for (const unit of units) {
+    if (parentOf.has(unit.id)) continue
+    const candidates = units.filter(candidate =>
+      !wouldCreateCycle(unit.id, candidate.id, parentOf),
+    )
+    parentOf.set(unit.id, inferParent(unit, candidates))
   }
 
   breakCycles(parentOf)
   return parentOf
+}
+
+function notificationParent(
+  unit: BranchUnit,
+  units: BranchUnit[],
+  parentOf: Map<string, string | null>,
+): string | null | undefined {
+  const origin = [...unit.forkOrigins].sort((a, b) => b.timestamp - a.timestamp)[0]
+  if (origin === undefined) return undefined
+  const inherited = unit.messages.filter(message => message.timestamp <= origin.sharedThrough)
+  if (inherited.length === 0 || !inherited.some(message => message.uuid === origin.anchorUuid)) return null
+  const candidates = units.filter(candidate => {
+    const sourceOrigin = cliOrigin(candidate)
+    const sourceBorn = sourceOrigin === undefined ? 0
+      : sourceOrigin.kind === 'fork' ? sourceOrigin.timestamp : sourceOrigin.createdAt ?? sourceOrigin.sharedThrough
+    // A later branch may copy all of the original source's history too. Its
+    // own creation boundary proves it did not exist at this fork's cutoff.
+    return sourceBorn <= origin.sharedThrough
+      && !wouldCreateCycle(unit.id, candidate.id, parentOf)
+      && !candidate.uuidSet.has(origin.markerUuid)
+      && inherited.every(message => candidate.uuidSet.has(message.uuid))
+  })
+  if (candidates.length === 1) return candidates[0]!.id
+  return null
+}
+
+function cliOrigin(unit: BranchUnit):
+  | (TranscriptBranchOrigin & { kind: 'branch' })
+  | (TranscriptForkOrigin & { kind: 'fork' })
+  | undefined {
+  const fork = [...unit.forkOrigins].sort((a, b) => b.timestamp - a.timestamp)[0]
+  const branch = [...unit.branchOrigins].sort((a, b) => b.sharedThrough - a.sharedThrough)[0]
+  // /branch rewrites copied records' forkedFrom to its immediate source.
+  // A later /fork notification belongs to the new fork; older copied
+  // notifications belong to its ancestor and cannot change its type.
+  if (branch !== undefined && (fork === undefined || (branch.createdAt ?? branch.sharedThrough) >= fork.timestamp)) return { ...branch, kind: 'branch' }
+  return fork === undefined ? undefined : { ...fork, kind: 'fork' }
+}
+
+function provenanceParent(
+  unit: BranchUnit,
+  byTranscriptId: Map<string, BranchUnit>,
+  parentOf: Map<string, string | null>,
+): string | null {
+  if (!unit.foreignIsPrefix) return null
+  const sources = [...unit.foreignSessionIds].sort((a, b) => b[1] - a[1])
+  for (const [id] of sources) {
+    const source = byTranscriptId.get(id)
+    if (source === undefined || wouldCreateCycle(unit.id, source.id, parentOf)) continue
+    return source.id
+  }
+  return null
+}
+
+function wouldCreateCycle(child: string, parent: string, parentOf: Map<string, string | null>): boolean {
+  const seen = new Set<string>()
+  let current: string | null = parent
+  while (current !== null && !seen.has(current)) {
+    if (current === child) return true
+    seen.add(current)
+    current = parentOf.get(current) ?? null
+  }
+  return false
 }
 
 /**
@@ -453,9 +617,21 @@ function buildCard(
     : unit.messages.filter(message => !parentUuids.has(message.uuid))
   const firstUser = own.find(isUserPrompt) ?? unit.messages.find(isUserPrompt)
   const last = unit.messages.length > 0 ? unit.messages[unit.messages.length - 1] : undefined
+  const origin = cliOrigin(unit)
+  const branchType = origin?.kind ?? (parent === undefined ? 'root' : unit.app === undefined ? 'branch' : 'fork')
+  const prompt = unit.messages.find(message =>
+    (message.isUserPrompt ?? isUserPrompt(message))
+    && (origin === undefined || message.timestamp > origin.sharedThrough)
+    && (parentUuids === undefined || !parentUuids.has(message.uuid)),
+  )
 
   return {
     sessionId: unit.id,
+    cliSessionId: unit.app?.cliSessionId || unit.primary.id,
+    branchType,
+    branchFirstUserMessage: prompt === undefined
+      ? branchType === 'root' ? '（尚未输入提示词）' : '（分支后尚未输入提示词）'
+      : shorten(prompt.preview.replace(/^You:\s*/, ''), 240),
     title: unit.app?.title ?? unit.primary.title ?? `会话 ${shortId(unit.id)}`,
     matchTitle: unit.app?.title ?? unit.primary.title?.trim() ?? '',
     firstUserMessage: firstUser === undefined

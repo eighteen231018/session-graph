@@ -20,6 +20,11 @@ export type SessionInfo = {
 
 export type BranchCard = {
   sessionId: string
+  /** The live CLI transcript id accepted by `claude --resume`. */
+  cliSessionId?: string
+  branchType?: 'root' | 'fork' | 'branch'
+  /** First actual user prompt after this branch's creation, for CLI cards. */
+  branchFirstUserMessage?: string
   title: string
   matchTitle: string
   firstUserMessage: string

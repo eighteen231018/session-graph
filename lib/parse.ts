@@ -6,12 +6,31 @@ export type ParsedMessage = {
   preview: string
   sessionId: string
   isSidechain: boolean
+  /** CLI-only presentation metadata; inherited prompts are excluded later. */
+  isUserPrompt?: boolean
 }
 
 export type ParsedTranscript = {
   messages: ParsedMessage[]
+  forkOrigins: TranscriptForkOrigin[]
+  continuedInSessionId?: string
+  branchOrigin?: TranscriptBranchOrigin
   title?: string
   firstTimestamp: number
+}
+
+/** Host-written /fork notification; message ids survive rewritten sessionIds. */
+export type TranscriptForkOrigin = {
+  markerUuid: string
+  anchorUuid: string
+  sharedThrough: number
+  timestamp: number
+}
+
+export type TranscriptBranchOrigin = {
+  parentSessionId: string
+  sharedThrough: number
+  createdAt?: number
 }
 
 type RawRecord = {
@@ -24,6 +43,14 @@ type RawRecord = {
   isSidechain?: unknown
   customTitle?: unknown
   aiTitle?: unknown
+  origin?: unknown
+  promptSource?: unknown
+  continuedInSessionId?: unknown
+  forkedFrom?: unknown
+  isMeta?: unknown
+  subtype?: unknown
+  content?: unknown
+  commandRun?: unknown
 }
 
 type RawNode = {
@@ -43,6 +70,9 @@ export function parseTranscript(text: string, fileId: string): ParsedTranscript 
   let title: string | undefined
   let firstTimestamp = 0
   let lastTs = 0
+  const continuations = new Set<string>()
+  const branchSources = new Set<string>()
+  let branchSharedThrough: number | undefined
 
   for (const line of text.split('\n')) {
     if (line.trim() === '') continue
@@ -53,6 +83,14 @@ export function parseTranscript(text: string, fileId: string): ParsedTranscript 
       continue
     }
     raw.push(record)
+
+    // A copied transcript can contain another session's metadata. Only the
+    // source file's own continuation record establishes its replacement.
+    if (record.type === 'continued-in' && record.sessionId === fileId
+      && typeof record.continuedInSessionId === 'string'
+      && record.continuedInSessionId.trim() !== '' && record.continuedInSessionId !== fileId) {
+      continuations.add(record.continuedInSessionId)
+    }
 
     if (firstTimestamp === 0) {
       const first = parseFirstTimestamp(record.timestamp)
@@ -72,6 +110,13 @@ export function parseTranscript(text: string, fileId: string): ParsedTranscript 
       parent: typeof record.parentUuid === 'string' && record.parentUuid !== '' ? record.parentUuid : null,
       timestamp: ts,
     })
+    const copied = record.forkedFrom as { sessionId?: unknown; messageUuid?: unknown } | null | undefined
+    if (record.sessionId === fileId && record.isSidechain !== true
+      && typeof copied?.sessionId === 'string' && copied.sessionId !== '' && copied.sessionId !== fileId
+      && copied.messageUuid === record.uuid) {
+      branchSources.add(copied.sessionId)
+      if (branchSharedThrough === undefined || ts > branchSharedThrough) branchSharedThrough = ts
+    }
   }
 
   const messageUuids = new Set<string>()
@@ -95,6 +140,7 @@ export function parseTranscript(text: string, fileId: string): ParsedTranscript 
   }
 
   const messages: ParsedMessage[] = []
+  const forkOrigins: TranscriptForkOrigin[] = []
   const seen = new Set<string>()
   for (const record of raw) {
     if (record.type !== 'user' && record.type !== 'assistant') continue
@@ -102,18 +148,65 @@ export function parseTranscript(text: string, fileId: string): ParsedTranscript 
     seen.add(record.uuid)
     const summary = summarizeContent(record.message)
     const role: 'user' | 'assistant' = record.type === 'assistant' ? 'assistant' : 'user'
+    const parentUuid = nearestMessageParent(record.parentUuid)
+    const timestamp = records.get(record.uuid)?.timestamp ?? 0
+    const forkOrigin = forkOriginOf(record, summary.text, parentUuid, timestamp)
+    if (forkOrigin !== null) forkOrigins.push(forkOrigin)
     messages.push({
       uuid: record.uuid,
-      parentUuid: nearestMessageParent(record.parentUuid),
-      timestamp: records.get(record.uuid)?.timestamp ?? 0,
+      parentUuid,
+      timestamp,
       role,
       preview: makePreview(role, summary),
       sessionId: typeof record.sessionId === 'string' ? record.sessionId : fileId,
       isSidechain: record.isSidechain === true,
+      isUserPrompt: role === 'user' && record.isMeta !== true && record.isSidechain !== true
+        && record.promptSource !== 'system'
+        && !/^\s*<(?:command-name|local-command-|task-notification|system-reminder|teammate-message|bash-)/i.test(summary.text)
+        && previewOf(summary.text) !== '',
     })
   }
 
-  return { messages, title, firstTimestamp }
+  const continuedInSessionId = continuations.size === 1 ? [...continuations][0] : undefined
+  const parentSessionId = branchSources.size === 1 ? [...branchSources][0] : undefined
+  let branchCreatedAt: number | undefined
+  for (const record of raw) {
+    const command = record.commandRun as { command?: unknown } | undefined | null
+    if (record.type !== 'system' || record.subtype !== 'local_command' || record.sessionId !== fileId
+      || command?.command !== 'branch' || typeof record.content !== 'string') continue
+    const ids = /You are now in the new branch \(session ([0-9a-f-]{36})\)\. Use \/resume ([0-9a-f-]{36})/i.exec(record.content)
+    const timestamp = parseFirstTimestamp(record.timestamp)
+    if (ids?.[1] === fileId && ids[2] === parentSessionId && timestamp !== null && timestamp > 0) branchCreatedAt = timestamp
+  }
+  return {
+    messages, forkOrigins, title, firstTimestamp,
+    ...(continuedInSessionId === undefined ? {} : { continuedInSessionId }),
+    ...(parentSessionId === undefined || branchSharedThrough === undefined ? {} : {
+      branchOrigin: {
+        parentSessionId, sharedThrough: branchSharedThrough,
+        ...(branchCreatedAt === undefined ? {} : { createdAt: branchCreatedAt }),
+      },
+    }),
+  }
+}
+
+function forkOriginOf(
+  record: RawRecord,
+  text: string,
+  anchorUuid: string | null,
+  timestamp: number,
+): TranscriptForkOrigin | null {
+  const origin = record.origin as { kind?: unknown } | undefined | null
+  // Never interpret ordinary user text, queued copies, or a failed /fork
+  // command as lineage. This envelope is emitted by the CLI itself.
+  if (record.type !== 'user' || record.promptSource !== 'system' || origin?.kind !== 'task-notification') return null
+  if (record.isSidechain === true || anchorUuid === null || typeof record.uuid !== 'string') return null
+  const body = /^\s*<task-notification>\s*<fork-source>([\s\S]*?)<\/fork-source>\s*<\/task-notification>\s*$/.exec(text)?.[1]
+  if (body === undefined || !body.includes('This session began as a fork (copy) of another session')) return null
+  const cutoff = /The conversation up to (\S+) is shared history/.exec(body)?.[1]
+  const sharedThrough = cutoff === undefined ? NaN : Date.parse(cutoff)
+  if (!Number.isFinite(sharedThrough) || sharedThrough <= 0 || timestamp <= sharedThrough) return null
+  return { markerUuid: record.uuid, anchorUuid, sharedThrough, timestamp }
 }
 
 export function previewOf(text: string): string {

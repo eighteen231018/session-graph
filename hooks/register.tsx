@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderElement, Timer } from 'claude-code'
+import type { EngineInterface, Register, RenderElement, RenderSurface, Timer } from 'claude-code'
 import type { BranchCard, GraphSnapshot } from '../types'
 import { forgetAppSession } from '../lib/app-store'
 import { collectGraph, listSessionIds } from '../lib/collect'
@@ -7,7 +7,12 @@ import type { HostDeps } from '../lib/host'
 import { layoutCardTree } from '../lib/tree'
 import { buildLineGrid, glyphOf } from '../lib/lines'
 import { exportHtml } from '../lib/export'
-import { deleteAppSession, openSession } from '../lib/session-link'
+import { deleteAppSession, openSession, resumeCommand } from '../lib/session-link'
+import { isTerminalOnly, isTerminalSurface } from '../lib/surface'
+import { branchTypeLabel, cardsForSurface } from '../lib/presentation'
+import { layoutTerminalTree } from '../lib/terminal-layout'
+import { revealCurrent } from '../lib/navigation'
+import { resumeCliSession } from '../lib/cli-navigation'
 
 const PANE = 'session-graph'
 
@@ -27,6 +32,7 @@ async function depsOf($: EngineInterface): Promise<HostDeps> {
       xdgConfigHome: await $.env.get('XDG_CONFIG_HOME'),
     },
     sessionId: () => $.session.id(),
+    surfaces: () => $.session.surfaces(),
     sessionCwd: () => $.session.cwd(),
     sessionMessages: () => $.session.messages(),
     fsExists: path => $.fs.exists(path),
@@ -59,8 +65,7 @@ let watching = false
 let activeScan: Promise<RefreshOutcome> | null = null
 let lastScanAt = 0
 let lastSignature = ''
-let lastRenderContent = ''
-let lastRenderViewport = ''
+const lastRenders = new Map<string, { content: string; viewport: string }>()
 const deletingCards = new Set<string>()
 let linePhase = 0
 let lineTimer: Timer | undefined
@@ -212,7 +217,16 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('session.end', ($, e, next) => {
+  on('session.end', async ($, e, next) => {
+    if ((e.reason === 'resume' || e.reason === 'clear')
+      && isTerminalOnly(await $.session.surfaces().catch(() => []))) {
+      // /resume and /branch keep this REPL and module alive; no new start
+      // event is guaranteed. Keep watching the newly selected session.
+      knownIds = null
+      lastScanAt = 0
+      $.clock.after(400, () => { void refresh($, true) })
+      return next(e)
+    }
     pollTimer?.cancel()
     pollTimer = undefined
     watchTimer?.cancel()
@@ -235,20 +249,26 @@ export const register: Register = on => {
     const snapshot = outcome.status === 'ok' ? outcome.snapshot : await read($, snapshotAtom)
 
     if (argument === 'export') {
-      const result = await runExport($, snapshot, false)
+      const surfaces = await $.session.surfaces().catch(() => [])
+      const result = await runExport($, snapshot, false, surfaces[0])
       return { text: result.text }
     }
 
-    const current = cardsOf(snapshot).find(card => card.isCurrent)
+    const surfaces = await $.session.surfaces().catch(() => [])
+    const isTerminal = isTerminalOnly(surfaces)
+    const current = cardsForSurface(cardsOf(snapshot), isTerminal ? 'terminal' : undefined).find(card => card.isCurrent)
     const opened = await $.ui.open({
       id: PANE,
       title: current === undefined ? '会话分支图谱' : `分支树 · ${current.title}`,
-      ...(argument === 'focus' ? { focus: true as const } : {}),
+      ...(isTerminal ? { rows: 24 } : {}),
+      ...(isTerminal || argument === 'focus' ? { focus: true as const } : {}),
     })
     return {
       text: opened.isPlaced
         ? '会话分支图谱已打开。'
-        : `面板暂未显示：${opened.reason}（可在更宽的窗口重试）`,
+        : opened.reason.startsWith('no-surface')
+          ? '面板暂未显示：当前运行没有可绘制界面。'
+          : `面板暂未显示：${opened.reason}（可在更宽的窗口重试）`,
     }
   })
 
@@ -271,21 +291,25 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const surface = e.surface
+    const isTerminal = isTerminalSurface(surface)
     const snapshot = await read($, snapshotAtom)
-    const cards = cardsOf(snapshot)
+    const cards = cardsForSurface(cardsOf(snapshot), surface)
+    const current = cards.find(card => card.isCurrent)
     const titleById = new Map(cards.map(card => [card.sessionId, card.title]))
     const cardById = new Map(cards.map(card => [card.sessionId, card]))
     const columns = typeof e.props?.bodyColumns === 'number' && e.props.bodyColumns > 0
       ? e.props.bodyColumns
       : (e.viewport?.columns ?? 80)
-    const layout = layoutCardTree(cards, columns)
+    const terminalLayout = isTerminal ? layoutTerminalTree(cards, columns) : undefined
+    const layout = terminalLayout ?? layoutCardTree(cards, columns)
     const treeCards = cards.flatMap(card => {
       const position = layout.positions.get(card.sessionId)
       if (position === undefined) return []
       return [{
         sessionId: card.sessionId,
         title: (card.isCurrent ? '★ ' : '') + card.title,
-        meta: cardMeta(card, titleById),
+        meta: isTerminal ? branchTypeLabel(card) : cardMeta(card, titleById),
         body: card.firstUserMessage,
         isCurrent: card.isCurrent,
         x: position.x,
@@ -312,15 +336,16 @@ export const register: Register = on => {
       `${card.sessionId}:${card.title}:${card.parentSessionId ?? '-'}:${card.isCurrent ? '1' : '0'}`,
     ).join('|')}|${layout.connectors.length}`
     const viewportKey = `${layout.width}x${layout.height}:${columns}`
-    if (contentKey !== lastRenderContent) {
-      const first = lastRenderContent === ''
-      lastRenderContent = contentKey
-      lastRenderViewport = viewportKey
+    const lastRender = lastRenders.get(surface)
+    if (contentKey !== lastRender?.content) {
+      const first = lastRender === undefined
+      lastRenders.set(surface, { content: contentKey, viewport: viewportKey })
       $.ui.log(
         `session-graph: ${first ? '面板已绘制' : '面板已更新'}（${treeCards.length} 个分支 · ${layout.connectors.length} 条连线 · ${layout.width}x${layout.height} 格）`,
+        isTerminal ? { to: 'debug' } : undefined,
       )
-    } else if (viewportKey !== lastRenderViewport) {
-      lastRenderViewport = viewportKey
+    } else if (viewportKey !== lastRender.viewport) {
+      lastRenders.set(surface, { content: contentKey, viewport: viewportKey })
       $.ui.log(`session-graph: 视口变化 ${columns} 列 · 树 ${layout.width}x${layout.height} 格`, { to: 'debug' })
     }
 
@@ -332,7 +357,7 @@ export const register: Register = on => {
     // monospaced face are used instead: they share the cells the cards are
     // placed on, so runs and stems land exactly on card centres.
     const lineGrid = buildLineGrid(layout)
-    if (layout.connectors.length > 0) startLineAnimation($)
+    if (!isTerminal && layout.connectors.length > 0) startLineAnimation($)
     const byRow = new Map<number, typeof treeCards>()
     for (const card of treeCards) {
       const row = Math.max(0, Math.floor(card.y))
@@ -343,15 +368,15 @@ export const register: Register = on => {
     const lineColor = (level: number): string =>
       LEVEL_COLORS[(Math.max(1, level) - 1) % LEVEL_COLORS.length]!
     const pulseAt = (flow: number): boolean =>
-      ((flow - linePhase) % PULSE_SPAN + PULSE_SPAN) % PULSE_SPAN < PULSE_WIDTH
+      !isTerminal && ((flow - linePhase) % PULSE_SPAN + PULSE_SPAN) % PULSE_SPAN < PULSE_WIDTH
     const open = (sessionId: string): void => {
       const card = cardById.get(sessionId)
-      if (card !== undefined) void openCard($, card)
+      if (card !== undefined) void openCard($, card, surface)
     }
     const remove = (sessionId: string): void => {
       const card = cardById.get(sessionId)
       if (card !== undefined) {
-        $.clock.after(1, () => { void deleteCard($, card) })
+        $.clock.after(1, () => { void deleteCard($, card, surface) })
       }
     }
 
@@ -360,13 +385,19 @@ export const register: Register = on => {
     while (row < layout.height) {
       const rowCards = byRow.get(row)
       if (rowCards !== undefined && rowCards.length > 0) {
+        const rowHeight = Math.max(...rowCards.map(card => card.height))
         const children: RenderElement[] = []
         let cursor = 0
         for (const card of rowCards) {
           const left = Math.max(0, Math.min(Math.floor(card.x), Math.max(0, layout.width - 1)))
           const width = Math.max(1, Math.min(Math.floor(card.width), layout.width - left))
           if (left > cursor) {
-            children.push(<Box key={`space:${row}:${card.sessionId}`} width={left - cursor} />)
+            const prefix = terminalLayout?.prefixes.get(card.sessionId)
+            children.push(prefix === undefined
+              ? <Box key={`space:${row}:${card.sessionId}`} width={left - cursor} />
+              : <Box key={`space:${row}:${card.sessionId}`} width={left - cursor} height={card.height} flexShrink={0} paddingTop={1}>
+                <Text mono dimColor>{prefix.padStart(left - cursor, ' ')}</Text>
+              </Box>)
           }
           const inner = Math.max(6, width - 4)
           const hasChildren = cards.some(candidate => candidate.parentSessionId === card.sessionId)
@@ -374,7 +405,7 @@ export const register: Register = on => {
             <Box
               key={card.sessionId}
               width={width}
-              height={9}
+              height={card.height}
               flexShrink={0}
               paddingX={1}
               borderStyle={card.isCurrent ? 'double' : 'round'}
@@ -384,7 +415,7 @@ export const register: Register = on => {
             >
               <Button key={`${card.sessionId}:title`} plain onPress={() => open(card.sessionId)}>
                 <Text weight="semibold" color={card.isCurrent ? accentColor : normalColor}>
-                  {fitText(card.title, inner)}
+                  {fitText(card.title, isTerminal ? inner - 1 : inner)}
                 </Text>
               </Button>
               <Text color={card.isCurrent ? accentColor : normalColor} dimColor={!card.isCurrent}>
@@ -392,7 +423,7 @@ export const register: Register = on => {
               </Text>
               <Button key={`${card.sessionId}:body`} plain onPress={() => open(card.sessionId)}>
                 <Text color={card.isCurrent ? accentColor : normalColor}>
-                  {fitText(card.body, inner * 4)}
+                  {fitText(card.body, isTerminal ? inner - 1 : inner * 4)}
                 </Text>
               </Button>
               <Box flexDirection="row" gap={1}>
@@ -400,10 +431,12 @@ export const register: Register = on => {
                   <Text color={accentColor}>当前</Text>
                 ) : (
                   <Button key={`${card.sessionId}:open`} plain onPress={() => open(card.sessionId)}>
-                    <Text color={normalColor}>打开</Text>
+                    <Text color={normalColor}>{isTerminal ? '跳转' : '打开'}</Text>
                   </Button>
                 )}
-                <Button key={`${card.sessionId}:delete`} plain dimColor={card.isCurrent || hasChildren} onPress={() => remove(card.sessionId)}>删除</Button>
+                {isTerminal ? null : (
+                  <Button key={`${card.sessionId}:delete`} plain dimColor={card.isCurrent || hasChildren} onPress={() => remove(card.sessionId)}>删除</Button>
+                )}
               </Box>
             </Box>,
           )
@@ -413,9 +446,9 @@ export const register: Register = on => {
           children.push(<Box key={`space:end:${row}`} width={layout.width - cursor} />)
         }
         rows.push(
-          <Box key={`row:${row}`} flexDirection="row" width={layout.width} height={9}>{children}</Box>,
+          <Box key={`row:${row}`} flexDirection="row" width={layout.width} height={rowHeight}>{children}</Box>,
         )
-        row += 9
+        row += rowHeight
         continue
       }
 
@@ -464,27 +497,38 @@ export const register: Register = on => {
     }
 
     return (
-      <Box flexDirection="column" gap={1}>
+      <Box flexDirection="column" gap={isTerminal ? 0 : 1}>
         <Box flexDirection="row" gap={1} flexWrap="wrap">
-          <Button key="view-cards" variant="primary" onPress={() => { void manualRefresh($) }}>卡片</Button>
-          <Button key="refresh" onPress={() => { void manualRefresh($) }}>刷新</Button>
+          {isTerminal ? null : <Button key="view-cards" variant="primary" onPress={() => { void manualRefresh($) }}>卡片</Button>}
+          <Button key="refresh" hotkey={isTerminal ? 'r' : undefined} onPress={() => { void manualRefresh($) }}>刷新</Button>
           <Button
             key="export"
+            hotkey={isTerminal ? 'e' : undefined}
             onPress={() => {
-              void runExport($, snapshot, true)
+              void runExport($, snapshot, true, surface)
             }}
           >
-            导出 HTML
+            {isTerminal ? '导出' : '导出 HTML'}
           </Button>
           <Button
             key="copy"
+            hotkey={isTerminal ? 'c' : undefined}
             onPress={() => {
-              void $.ui.copy({ text: currentSessionId(snapshot), surface: e.surface })
+              void $.ui.copy({ text: isTerminal && current !== undefined ? current.title : currentSessionId(snapshot), surface: e.surface })
             }}
           >
-            复制会话 ID
+            {isTerminal ? '复制 ID' : '复制会话 ID'}
           </Button>
+          {isTerminal && current !== undefined ? (
+            <Button key="locate-current" hotkey="g" onPress={() => { void locateCurrent($, current.sessionId) }}>当前</Button>
+          ) : null}
         </Box>
+
+        {isTerminal && current !== undefined ? <Text key="current-session" color={accentColor}>{fitText(`当前：${current.title}`, columns - 1)}</Text> : null}
+
+        {isTerminal ? <Text dimColor>{fitText('Tab/Enter 操作 · ↑↓ 滚动 · r 刷新 · g 当前', columns - 1)}</Text> : null}
+
+        {terminalLayout?.mode === 'outline' ? <Text key="compact-notice" dimColor>窗口较窄，分支已纵向排列。</Text> : null}
 
         {snapshot.notice === undefined ? null : <Text dimColor>⚠ {snapshot.notice}</Text>}
 
@@ -493,7 +537,9 @@ export const register: Register = on => {
         ) : (
           <>
             <Box flexDirection="column" width={layout.width} height={layout.height}>{rows}</Box>
-            <Text dimColor>{summaryLine(snapshot)} · 点击卡片标题或正文进入会话；删除按钮在卡片底部</Text>
+            <Text dimColor>{isTerminal
+              ? `${summaryLine(snapshot)} · Tab/Shift+Tab 选择，Enter 跳转会话；↑↓ 滚动；r 刷新、e 导出、c 复制 ID、g 定位当前`
+              : `${summaryLine(snapshot)} · 点击卡片标题或正文进入会话；删除按钮在卡片底部`}</Text>
           </>
         )}
       </Box>
@@ -517,6 +563,14 @@ function toastRefreshOutcome($: EngineInterface, outcome: RefreshOutcome): void 
 
 async function manualRefresh($: EngineInterface): Promise<void> {
   toastRefreshOutcome($, await refresh($, true))
+}
+
+async function locateCurrent($: EngineInterface, sessionId: string): Promise<void> {
+  const result = await revealCurrent(args => $.ui.scroll(args), sessionId)
+  if (!result.ok) {
+    $.ui.log(`session-graph: locate current failed: ${result.reason}`, { to: 'debug' })
+    $.ui.toast('暂时无法定位当前分支，请用方向键滚动')
+  }
 }
 
 function scheduleDesktopOpen($: EngineInterface, delayMs = 800): void {
@@ -564,12 +618,14 @@ async function openPane($: EngineInterface): Promise<boolean> {
 }
 
 async function retitlePane($: EngineInterface, snapshot: GraphSnapshot): Promise<void> {
-  const current = cardsOf(snapshot).find(card => card.isCurrent)
-  if (current === undefined) return
   try {
     const panes = await $.ui.panes()
     if (!panes.some(pane => pane.id === PANE)) return
-    await $.ui.open({ id: PANE, title: `分支树 · ${current.title}` })
+    const surfaces = await $.session.surfaces().catch(() => [])
+    const isTerminal = isTerminalOnly(surfaces)
+    const current = cardsForSurface(cardsOf(snapshot), isTerminal ? 'terminal' : undefined).find(card => card.isCurrent)
+    if (current === undefined) return
+    await $.ui.open({ id: PANE, title: `分支树 · ${current.title}`, ...(isTerminal ? { rows: 24 } : {}) })
   } catch {
     // The pane is gone or the title was refused; keep the old one.
   }
@@ -579,10 +635,11 @@ async function runExport(
   $: EngineInterface,
   snapshot: GraphSnapshot,
   notify: boolean,
+  surface?: string,
 ): Promise<{ ok: boolean; text: string }> {
   try {
-    const path = await exportHtml(await depsOf($), snapshot)
-    $.ui.log(`session-graph: exported ${path}`)
+    const path = await exportHtml(await depsOf($), snapshot, surface)
+    $.ui.log(`session-graph: exported ${path}`, isTerminalSurface(surface) ? { to: 'debug' } : undefined)
     if (notify) $.ui.toast('已导出静态视图')
     return { ok: true, text: `已导出静态视图：${path}` }
   } catch (error) {
@@ -614,22 +671,54 @@ function signatureOf(snapshot: GraphSnapshot): string {
     last?.nodeId ?? '',
     last?.timestamp ?? 0,
     snapshot.sessions.map(session => `${session.id}:${session.lastTimestamp}:${session.branchName}`).join(','),
-    cardsOf(snapshot).map(card => `${card.sessionId}:${card.title}:${card.ownMessageCount}:${card.lastTimestamp}`).join(','),
+    cardsOf(snapshot).map(card => `${card.sessionId}:${card.cliSessionId ?? ''}:${card.parentSessionId ?? ''}:${card.title}:${card.branchType ?? ''}:${card.branchFirstUserMessage ?? ''}:${card.ownMessageCount}:${card.lastTimestamp}`).join(','),
     snapshot.hiddenNodeCount,
     snapshot.notice ?? '',
     snapshot.theme,
   ].join('|')
 }
 
-let lastOpen: { sessionId: string; at: number } | undefined
+let lastOpen: { sessionId: string; surface: RenderSurface; at: number } | undefined
+let cliOpening = false
 
-async function openCard($: EngineInterface, card: BranchCard): Promise<void> {
+async function openCard($: EngineInterface, card: BranchCard, surface: RenderSurface): Promise<void> {
   const now = Date.now()
-  if (lastOpen !== undefined && lastOpen.sessionId === card.sessionId && now - lastOpen.at < 600) return
-  lastOpen = { sessionId: card.sessionId, at: now }
+  if (lastOpen !== undefined && lastOpen.sessionId === card.sessionId && lastOpen.surface === surface && now - lastOpen.at < 600) return
+  lastOpen = { sessionId: card.sessionId, surface, at: now }
 
   if (card.isCurrent) {
     $.ui.toast('这是当前会话')
+    return
+  }
+
+  if (isTerminalSurface(surface)) {
+    if (cliOpening) {
+      $.ui.toast('正在跳转会话，请稍候')
+      return
+    }
+    cliOpening = true
+    $.ui.toast('正在跳转会话…')
+    const command = resumeCommand(card.cliSessionId || card.sessionId)
+    try {
+      const result = await resumeCliSession({
+        sessionId: () => $.session.id(),
+        sessionCwd: () => $.session.cwd(),
+        commandRun: args => $.command.run(args),
+        processRun: (argv, init) => $.process.run(argv, init),
+        sleep: ms => $.clock.sleep(ms),
+        debug: message => { $.ui.log(`session-graph: ${message}`, { to: 'debug' }) },
+      }, card)
+      if (result.opened) {
+        $.ui.toast(result.stoppedBackground ? '已停止目标后台会话并跳转' : '已跳转会话')
+        void refresh($, true)
+      } else {
+        $.ui.log(`session-graph: resume failed: ${result.message}`, { to: 'debug' })
+        const copied = command !== '' && await $.ui.copy({ text: command, surface }).then(r => r.isCopied, () => false)
+        $.ui.toast(`跳转失败：${truncate(result.message, 100)}${copied ? '；已复制恢复命令' : ''}`)
+      }
+    } finally {
+      cliOpening = false
+    }
     return
   }
 
@@ -655,7 +744,11 @@ async function openCard($: EngineInterface, card: BranchCard): Promise<void> {
   }
 }
 
-async function deleteCard($: EngineInterface, card: BranchCard): Promise<void> {
+async function deleteCard($: EngineInterface, card: BranchCard, surface: RenderSurface): Promise<void> {
+  if (isTerminalSurface(surface)) {
+    $.ui.toast('CLI 中暂不支持删除会话；请在 Claude Code Desktop 中删除')
+    return
+  }
   if (card.isCurrent) {
     $.ui.toast('不能删除当前正在运行的会话')
     return

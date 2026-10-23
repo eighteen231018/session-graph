@@ -1,6 +1,18 @@
 import type { HostDeps } from './host'
 import { mcpResultText, parseJson, textBlocks } from './mcp-text'
 
+/** Shell spelling for exports and the fallback when in-place /resume fails. */
+export function resumeCommand(sessionId: string): string {
+  const id = sessionId.startsWith('local_') ? sessionId.slice(6) : sessionId
+  if (id === '') return ''
+  // Transcript filenames normally contain UUIDs. Quote other ids so a copied
+  // command cannot interpret filename characters as shell syntax or options.
+  const argument = /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(id)
+    ? id
+    : `'${id.replace(/'/g, `'\\''`)}'`
+  return `claude --resume ${argument}`
+}
+
 export type SessionTarget = {
   sessionId: string
   title: string

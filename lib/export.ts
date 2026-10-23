@@ -2,17 +2,21 @@ import type { HostDeps } from './host'
 import type { GraphSnapshot } from '../types'
 import { connectorPath } from './lines'
 import { layoutCardTree } from './tree'
+import { resumeCommand } from './session-link'
+import { isTerminalSurface } from './surface'
+import { branchTypeLabel, cardsForSurface } from './presentation'
 
 export type ExportDeps = Pick<HostDeps, 'sessionId' | 'sessionCwd' | 'fsWrite'>
 
-export async function exportHtml(deps: ExportDeps, snapshot: GraphSnapshot): Promise<string> {
+export async function exportHtml(deps: ExportDeps, snapshot: GraphSnapshot, surface?: string): Promise<string> {
+  const isTerminal = isTerminalSurface(surface)
   const sessionId = await deps.sessionId()
   const cwd = await deps.sessionCwd()
   // The full id, not a short prefix: app session ids share the `local_`
   // prefix, and a short stem would make two exports overwrite each other.
   const path = `${cwd}/session-graph-${sessionId}.html`
-  const cards = Array.isArray(snapshot.cards) ? snapshot.cards : []
-  const layout = layoutCardTree(cards, 110)
+  const cards = cardsForSurface(Array.isArray(snapshot.cards) ? snapshot.cards : [], surface)
+  const layout = layoutCardTree(cards, 110, isTerminal ? { minCardWidth: 44, maxCardWidth: 52 } : {})
 
   const data = JSON.stringify({
     nodes: snapshot.nodes,
@@ -53,9 +57,11 @@ export async function exportHtml(deps: ExportDeps, snapshot: GraphSnapshot): Pro
     const fork = card.forkAtPreview === null ? '' : ` · 分叉点：${escapeHtml(card.forkAtPreview.slice(0, 60))}`
     return `<article class="card${card.isCurrent ? ' current' : ''}" style="left:${position.x * scaleX}px;top:${position.y * scaleY}px;width:${position.width * scaleX}px;height:${position.height * scaleY}px">
   <h2>${card.isCurrent ? '★ ' : ''}${escapeHtml(card.title)}</h2>
-  <p class="meta">${parent}${fork}</p>
+  <p class="meta">${isTerminal ? `${branchTypeLabel(card)} · ` : ''}${parent}${fork}</p>
   <p class="body">${escapeHtml(card.firstUserMessage)}</p>
-  <p class="meta">会话 ID：<code>${escapeHtml(card.sessionId)}</code></p>
+  <p class="meta">${isTerminal
+    ? `恢复命令：<code>${escapeHtml(resumeCommand(card.cliSessionId || card.sessionId))}</code>`
+    : `会话 ID：<code>${escapeHtml(card.sessionId)}</code>`}</p>
 </article>`
   }).join('')
 
@@ -95,7 +101,9 @@ ${lineHtml}
 </svg>
 ${cardsHtml}
 </div>
-<p class="note">静态导出不执行跳转；在插件 Pane 中点击卡片会尝试打开对应会话。父卡片居中于子卡片上方，连接线按分支层级着色，亮色短线沿线流动。</p>
+<p class="note">${isTerminal
+  ? '在同一项目目录的终端中运行 claude --resume &lt;id&gt; 恢复对应会话。'
+  : '静态导出不执行跳转；在插件 Pane 中点击卡片会尝试打开对应会话。'}父卡片居中于子卡片上方，连接线按分支层级着色，亮色短线沿线流动。</p>
 <script type="application/json" id="session-graph-data">${data}</script>
 </body>
 </html>`

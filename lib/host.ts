@@ -21,6 +21,7 @@ export type HostEnv = {
 export type HostDeps = {
   readonly env: HostEnv
   readonly sessionId: EngineInterface['session']['id']
+  readonly surfaces: EngineInterface['session']['surfaces']
   readonly sessionCwd: EngineInterface['session']['cwd']
   readonly sessionMessages: () => Promise<SessionMessage[]>
   readonly fsExists: EngineInterface['fs']['exists']

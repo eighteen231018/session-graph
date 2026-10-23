@@ -6,6 +6,7 @@ import type { HostDeps } from './host'
 import { mcpResultText, parseJson } from './mcp-text'
 import { parseTranscript, previewOf, type ParsedTranscript } from './parse'
 import { listAppSessions, type AppSessionRow } from './session-link'
+import { isTerminalOnly } from './surface'
 
 export type CollectDeps = HostDeps
 
@@ -53,8 +54,15 @@ export async function collectGraph(deps: CollectDeps): Promise<GraphSnapshot> {
   if (visible.length === 0) {
     return linearFallback(deps, sessionId, theme, scannedAt, '转录已删除；已降级为官方会话消息的线性视图。')
   }
-  await applyCreationTimes(deps, visible, appScan.records)
-  const snapshot = buildGraph(visible, sessionId, theme, scannedAt, undefined, appScan.records)
+  const capabilities = await deps.surfaces().then(
+    surfaces => {
+      const cliOnly = isTerminalOnly(surfaces)
+      return { hasAppManager: surfaces.includes('desktop'), cliForkOrigins: cliOnly, cliContinuations: cliOnly }
+    },
+    () => ({ hasAppManager: false, cliForkOrigins: false, cliContinuations: false }),
+  )
+  await applyCreationTimes(deps, visible, appScan.records, capabilities.hasAppManager)
+  const snapshot = buildGraph(visible, sessionId, theme, scannedAt, undefined, appScan.records, capabilities)
   if (!snapshot.cards.some(card => card.isCurrent)) {
     return linearFallback(
       deps,
@@ -200,33 +208,27 @@ async function readSessionFiles(deps: CollectDeps, dir: string, currentSessionId
     const path = `${dir}/${entry.name}`
     const id = entry.name.slice(0, -6)
     const cached = cache.get(path)
+    let parsed: ParsedTranscript
     if (cached !== undefined && cached.mtimeMs === entry.mtimeMs) {
-      files.push({
-        id,
-        path,
-        mtimeMs: entry.mtimeMs,
-        // A fork copies the parent's messages and their timestamps, so the
-        // first message's time is not when this session was created. Only an
-        // app record's createdAt may fill this in; inheritance must not rest
-        // on a copied timestamp.
-        createdAt: 0,
-        title: cached.parsed.title,
-        messages: cached.parsed.messages,
-      })
-      continue
+      parsed = cached.parsed
+    } else {
+      const text = await readTranscript(deps, path)
+      if (text === null) continue
+      parsed = parseTranscript(text, id)
+      cache.set(path, { mtimeMs: entry.mtimeMs, parsed })
     }
-
-    const text = await readTranscript(deps, path)
-    if (text === null) continue
-    const parsed = parseTranscript(text, id)
-    cache.set(path, { mtimeMs: entry.mtimeMs, parsed })
     files.push({
       id,
       path,
       mtimeMs: entry.mtimeMs,
+      // Forks copy message timestamps; only App metadata can supply an
+      // actual creation time. Never infer it from the first copied message.
       createdAt: 0,
       title: parsed.title,
       messages: parsed.messages,
+      forkOrigins: parsed.forkOrigins,
+      continuedInSessionId: parsed.continuedInSessionId,
+      branchOrigin: parsed.branchOrigin,
     })
   }
 
@@ -251,6 +253,7 @@ async function applyCreationTimes(
   deps: CollectDeps,
   files: SessionFile[],
   appSessions: AppSessionRecord[],
+  hasAppManager: boolean,
 ): Promise<void> {
   const recordOfTranscript = new Map<string, AppSessionRecord>()
   for (const record of appSessions) {
@@ -269,6 +272,10 @@ async function applyCreationTimes(
     }
   }
   if (unmatched.length === 0) return
+
+  // Local app records remain useful on every surface. Only the remote
+  // manager fallback requires an attached desktop; recheck on each scan.
+  if (!hasAppManager) return
 
   let rows: AppSessionRow[] | null = null
   try {
@@ -417,8 +424,13 @@ async function linearFallback(
     lastTimestamp,
   }
   const firstUser = rows.find(message => message.role === 'user' && previewOf(message.text) !== '')
+  const cliFirstUser = rows.find(message => message.role === 'user' && previewOf(message.text) !== ''
+    && !/^\s*<(?:command-name|local-command-|task-notification|system-reminder|teammate-message|bash-)/i.test(message.text))
   const card: BranchCard = {
     sessionId,
+    cliSessionId: sessionId,
+    branchType: 'root',
+    branchFirstUserMessage: cliFirstUser === undefined ? '（尚未输入提示词）' : previewOf(cliFirstUser.text),
     title: `会话 ${sessionId.slice(0, 8)}`,
     matchTitle: '',
     firstUserMessage: firstUser === undefined ? '（没有用户消息）' : previewOf(firstUser.text),
